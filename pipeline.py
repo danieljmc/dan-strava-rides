@@ -1,11 +1,12 @@
-# pipeline.py
+# pipeline.py  (riders v3)
 import os, json, time, re
-from datetime import datetime
 import requests
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
+
+print("PIPELINE VERSION: riders v3")
 
 # ---------------- Config ----------------
 PER_PAGE = 200
@@ -58,8 +59,8 @@ def fetch_gear_map(access_token):
         return {}
     resp = requests.get(
         "https://www.strava.com/api/v3/athlete",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=30,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -75,68 +76,49 @@ def fetch_gear_map(access_token):
 # ---------------- Riders parsing ----------------
 WITH_PATTERN = re.compile(r"\bwith\b", flags=re.IGNORECASE)
 
-# Common non-name tokens to filter (lowercase)
 STOPWORDS = {
-    # activities / verbs / time of day
     "solo","loop","ride","walk","hike","skate","skating","biking","cycling","trainer","activity",
     "morning","afternoon","evening","lunch","first","return","reverse","leisurely","slow",
-    # generic geography / features
     "rd","road","street","blvd","park","path","trail","drive","point","beach","lake","falls","notch",
     "green","bridge","bridges","river","coast","campground","maze","summit",
-    # directions
     "north","south","east","west",
-    # misc
     "boys","family","home","dad",
-    # acronyms / locales you often use
     "ebbp","nh","ri","fl",
-    # some local place words that show up often
     "newport","providence","sakonnet","sakonnett","acoaxet","bulgamarsh","horseneck",
     "padenarem","padanaram","dartmouth","westport","adamsville","sepowet","seapowet","blackstone",
     "bristol","portsmouth","lincoln","waterville","valley","kancamagus","conway","taunton",
 }
 
-# treat this lowercase phrase as a single token if seen in parentheses
 KEEP_PHRASES = {"the boys"}
 
-def strip_parens(text: str) -> str:
-    t = text.strip()
+def strip_parens(t: str) -> str:
+    t = t.strip()
     if t.startswith("(") and t.endswith(")"):
         return t[1:-1].strip()
     return t
 
 def is_name_token(tok: str) -> bool:
-    """Heuristic to keep likely person names and drop places/verbs."""
     if not tok:
         return False
     lt = tok.lower()
-    if lt in KEEP_PHRASES:
-        return True
-    if lt in STOPWORDS:
-        return False
-    if any(ch.isdigit() for ch in tok):
-        return False
-    if tok.endswith("'s") and lt != "o's":   # drop possessives like Gray's
-        return False
-    if len(tok) >= 2 and tok.isupper():
-        return False  # acronyms like EBBP, NH
-    # require leading capital (Title-like); allow "Al" etc.
+    if lt in KEEP_PHRASES: return True
+    if lt in STOPWORDS:    return False
+    if any(ch.isdigit() for ch in tok): return False
+    if tok.endswith("'s") and lt != "o's": return False
+    if len(tok) >= 2 and tok.isupper():   return False
     return tok[0].isupper()
 
 def split_by_commas_and_and(s: str) -> list[str]:
     s = s.replace("&", " and ")
     s = re.sub(r"\s+and\s+", ",", s, flags=re.IGNORECASE)
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    return parts
+    return [p.strip() for p in s.split(",") if p.strip()]
 
 def tokenize_names(segment: str) -> list[str]:
-    """From a segment that should mainly contain names, produce per-word name tokens,
-       preserving KEEP_PHRASES and filtering STOPWORDS."""
     out = []
     for part in split_by_commas_and_and(segment):
         core = strip_parens(part)
         if core.lower() in KEEP_PHRASES:
-            out.append(core.title())
-            continue
+            out.append(core.title()); continue
         for w in core.split():
             w = w.strip()
             if is_name_token(w):
@@ -149,7 +131,6 @@ def tokenize_names(segment: str) -> list[str]:
     return unique
 
 def extract_riders_from_name(activity_name: str) -> list[str]:
-    """Primary rule: names after 'with'. Fallback: scan entire string for name-like tokens."""
     if not activity_name:
         return []
     m = WITH_PATTERN.search(activity_name)
@@ -158,24 +139,23 @@ def extract_riders_from_name(activity_name: str) -> list[str]:
         names = tokenize_names(after)
         if names:
             return names
-    # Fallback: scan whole title for patterns of names even without 'with'
-    # Replace punctuation with spaces, but keep commas/&/and as splitters in tokenize_names
-    names = tokenize_names(activity_name)
-    return names
+    # fallback: scan whole title
+    return tokenize_names(activity_name)
 
 # ---------------- Flatten + enrich ----------------
 def normalize_activities(acts, gear_map):
     df = pd.json_normalize(acts, sep=".")
-    # Pretty datetime strings
+    # datetime
     for col in ("start_date_local", "start_date"):
         if col in df.columns:
             dt = pd.to_datetime(df[col], errors="coerce")
             df[col + "_fmt"] = dt.dt.strftime("%Y-%m-%d %H:%M:%S")
-    # Gear name
+    # gear
     if "gear_id" in df.columns:
         df["gear_name"] = df["gear_id"].map(lambda g: gear_map.get(g) if gear_map else None)
-    # Riders (from name)
+    # riders
     if "name" in df.columns and "id" in df.columns:
+        print("normalize_activities: 'name' and 'id' columns present.")
         riders_lists = df["name"].apply(extract_riders_from_name)
         df["other_riders"] = riders_lists.apply(lambda lst: ", ".join(lst) if lst else "")
         df["other_riders_count"] = riders_lists.apply(len)
@@ -183,13 +163,16 @@ def normalize_activities(acts, gear_map):
         total_mentions = int(df["other_riders_count"].sum())
         activities_with_any = int((df["other_riders_count"] > 0).sum())
         print(f"Rider parsing: {activities_with_any} activities contain riders; {total_mentions} rider names total.")
+        sample = df.loc[df["other_riders_count"] > 0, ["name","other_riders"]].head(5)
+        if not sample.empty:
+            print("Sample parsed riders:\n", sample.to_string(index=False))
     else:
-        print("Rider parsing skipped: 'name' or 'id' missing.")
-    # Convert nested lists/dicts to JSON strings so Sheets can hold them
+        print("normalize_activities: MISSING 'name' or 'id' — rider parsing skipped.")
+    # lists/dicts -> JSON strings
     for c in df.columns:
         if df[c].apply(lambda x: isinstance(x, (list, dict))).any():
             df[c] = df[c].apply(lambda v: json.dumps(v) if isinstance(v, (list, dict)) else v)
-    # Sort newest first
+    # sort
     sort_col = "start_date_local" if "start_date_local" in df.columns else ("start_date" if "start_date" in df.columns else None)
     if sort_col:
         df = df.sort_values(sort_col, ascending=False, kind="mergesort")
@@ -198,7 +181,7 @@ def normalize_activities(acts, gear_map):
 def build_riders_long(df_activities: pd.DataFrame) -> pd.DataFrame:
     cols = ["activity_id", "rider_name"]
     if "id" not in df_activities.columns or "other_riders" not in df_activities.columns:
-        print("riders_long: activities missing 'id' or 'other_riders'—returning empty.")
+        print("riders_long: missing 'id' or 'other_riders'; returning empty.")
         return pd.DataFrame(columns=cols)
     rows = []
     for act_id, riders in zip(df_activities["id"], df_activities["other_riders"]):
@@ -213,19 +196,21 @@ def build_riders_long(df_activities: pd.DataFrame) -> pd.DataFrame:
 # ---------------- Google Sheets I/O ----------------
 def gspread_client_from_secret():
     svc_info = json.loads(os.environ["GCP_SVC_JSON"])
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    # Include Drive scope (helps in some environments / shared drives)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
     creds = Credentials.from_service_account_info(svc_info, scopes=scopes)
     return gspread.authorize(creds)
 
 def write_df_to_tab(sh, title: str, df: pd.DataFrame):
-    # Ensure the worksheet exists
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows=str(max(len(df)+50, 200)), cols=str(max(26, len(df.columns)+5)))
     ws.clear()
     if df.empty:
-        # Write headers so the tab always exists
         headers = list(df.columns) if len(df.columns) > 0 else ["activity_id","rider_name"]
         ws.update("A1", [headers])
         ws.resize(rows=50, cols=max(5, len(headers)))
@@ -237,8 +222,14 @@ def write_df_to_tab(sh, title: str, df: pd.DataFrame):
 def write_dataframes_to_sheet(df_acts: pd.DataFrame, df_riders: pd.DataFrame):
     gc = gspread_client_from_secret()
     sh = gc.open_by_key(os.environ["SHEET_ID"])
-    write_df_to_tab(sh, TAB_ACTIVITIES, df_acts)
+
+    # Write riders FIRST so you can see its log line even if activities succeeds
     write_df_to_tab(sh, TAB_RIDERS_LONG, df_riders)
+    write_df_to_tab(sh, TAB_ACTIVITIES, df_acts)
+
+    # Final debug: list tabs present
+    titles = [ws.title for ws in sh.worksheets()]
+    print("Worksheets now present:", titles)
 
 # ---------------- Main ----------------
 def main():
