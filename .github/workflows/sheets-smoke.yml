@@ -1,0 +1,18 @@
+name: Google Sheets smoke test
+on:
+  workflow_dispatch: {}   # run manually
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install gspread google-auth gspread-dataframe pandas
+      - name: Run Sheets smoke test
+        env:
+          GCP_SVC_JSON: ${{ secrets.GCP_SVC_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: python sheets_smoke_test.py
