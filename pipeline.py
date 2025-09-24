@@ -1,3 +1,4 @@
+# pipeline.py
 import os, json, time, re
 from datetime import datetime
 import requests
@@ -8,8 +9,8 @@ from gspread_dataframe import set_with_dataframe
 
 # ---------------- Config ----------------
 PER_PAGE = 200
-TAB_ACTIVITIES = "activities_all"   # wide
-TAB_RIDERS_LONG = "riders_long"     # long (activity_id, rider_name)
+TAB_ACTIVITIES = "activities_all"   # wide table: all summary fields + parsed riders
+TAB_RIDERS_LONG = "riders_long"     # long table: (activity_id, rider_name)
 THROTTLE_S = 0.2
 ADD_GEAR_NAME = True
 
@@ -30,7 +31,7 @@ def get_strava_access_token():
     print("Strava token scope:", data.get("scope"))
     return data["access_token"]
 
-# ---------------- Fetch activities ----------------
+# ---------------- Fetch activities (summary) ----------------
 def fetch_all_activities(access_token):
     all_rows, page = [], 1
     while True:
@@ -57,8 +58,8 @@ def fetch_gear_map(access_token):
         return {}
     resp = requests.get(
         "https://www.strava.com/api/v3/athlete",
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=30,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -74,62 +75,98 @@ def fetch_gear_map(access_token):
 # ---------------- Riders parsing ----------------
 WITH_PATTERN = re.compile(r"\bwith\b", flags=re.IGNORECASE)
 
+# Common non-name tokens to filter (lowercase)
+STOPWORDS = {
+    # activities / verbs / time of day
+    "solo","loop","ride","walk","hike","skate","skating","biking","cycling","trainer","activity",
+    "morning","afternoon","evening","lunch","first","return","reverse","leisurely","slow",
+    # generic geography / features
+    "rd","road","street","blvd","park","path","trail","drive","point","beach","lake","falls","notch",
+    "green","bridge","bridges","river","coast","campground","maze","summit",
+    # directions
+    "north","south","east","west",
+    # misc
+    "boys","family","home","dad",
+    # acronyms / locales you often use
+    "ebbp","nh","ri","fl",
+    # some local place words that show up often
+    "newport","providence","sakonnet","sakonnett","acoaxet","bulgamarsh","horseneck",
+    "padenarem","padanaram","dartmouth","westport","adamsville","sepowet","seapowet","blackstone",
+    "bristol","portsmouth","lincoln","waterville","valley","kancamagus","conway","taunton",
+}
+
+# treat this lowercase phrase as a single token if seen in parentheses
+KEEP_PHRASES = {"the boys"}
+
 def strip_parens(text: str) -> str:
-    text = text.strip()
-    if text.startswith("(") and text.endswith(")"):
-        return text[1:-1].strip()   # keep inside as one token (e.g., "the boys")
-    return text
+    t = text.strip()
+    if t.startswith("(") and t.endswith(")"):
+        return t[1:-1].strip()
+    return t
 
-def split_riders(after_with: str) -> list[str]:
-    """
-    Splits riders after 'with' into *individual names*:
-      - "Rebecca Russell and Thomas (the boys)" -> ["Rebecca","Russell","Thomas","the boys"]
-      - "Thomas and Al" -> ["Thomas","Al"]
-      - "Al, Russell, Matt, and Dan" -> ["Al","Russell","Matt","Dan"]
-      - "Al & Dan" -> ["Al","Dan"]
-    """
-    if not after_with:
-        return []
+def is_name_token(tok: str) -> bool:
+    """Heuristic to keep likely person names and drop places/verbs."""
+    if not tok:
+        return False
+    lt = tok.lower()
+    if lt in KEEP_PHRASES:
+        return True
+    if lt in STOPWORDS:
+        return False
+    if any(ch.isdigit() for ch in tok):
+        return False
+    if tok.endswith("'s") and lt != "o's":   # drop possessives like Gray's
+        return False
+    if len(tok) >= 2 and tok.isupper():
+        return False  # acronyms like EBBP, NH
+    # require leading capital (Title-like); allow "Al" etc.
+    return tok[0].isupper()
 
-    s = after_with
+def split_by_commas_and_and(s: str) -> list[str]:
     s = s.replace("&", " and ")
-    s = re.sub(r"\s+and\s+", ",", s, flags=re.IGNORECASE)  # normalize 'and' to commas
+    s = re.sub(r"\s+and\s+", ",", s, flags=re.IGNORECASE)
     parts = [p.strip() for p in s.split(",") if p.strip()]
+    return parts
 
-    tokens: list[str] = []
-    for p in parts:
-        core = strip_parens(p)  # remove outer parens but keep inner text as one piece
-        # Now split names by whitespace into individual tokens
-        # e.g. "Rebecca Russell" -> ["Rebecca","Russell"]
-        #     "the boys" (from parens) stays as one token because we already stripped parens above
-        if core.lower() == "the boys":
-            tokens.append(core.title())  # keep phrase as one token
-        else:
-            tokens.extend([w for w in core.split() if w])
-
-    # Title-case simple tokens (won't perfectly handle every surname, but matches your request)
-    tokens = [t if t.isupper() else t.title() for t in tokens]
-
-    # De-dup while preserving order
-    seen, out = set(), []
-    for t in tokens:
+def tokenize_names(segment: str) -> list[str]:
+    """From a segment that should mainly contain names, produce per-word name tokens,
+       preserving KEEP_PHRASES and filtering STOPWORDS."""
+    out = []
+    for part in split_by_commas_and_and(segment):
+        core = strip_parens(part)
+        if core.lower() in KEEP_PHRASES:
+            out.append(core.title())
+            continue
+        for w in core.split():
+            w = w.strip()
+            if is_name_token(w):
+                out.append(w.title())
+    # de-dup preserve order
+    seen, unique = set(), []
+    for t in out:
         if t not in seen:
-            out.append(t); seen.add(t)
-    return out
+            unique.append(t); seen.add(t)
+    return unique
 
 def extract_riders_from_name(activity_name: str) -> list[str]:
+    """Primary rule: names after 'with'. Fallback: scan entire string for name-like tokens."""
     if not activity_name:
         return []
     m = WITH_PATTERN.search(activity_name)
-    if not m:
-        return []
-    return split_riders(activity_name[m.end():])
-
+    if m:
+        after = activity_name[m.end():]
+        names = tokenize_names(after)
+        if names:
+            return names
+    # Fallback: scan whole title for patterns of names even without 'with'
+    # Replace punctuation with spaces, but keep commas/&/and as splitters in tokenize_names
+    names = tokenize_names(activity_name)
+    return names
 
 # ---------------- Flatten + enrich ----------------
 def normalize_activities(acts, gear_map):
     df = pd.json_normalize(acts, sep=".")
-    # Add pretty datetime strings
+    # Pretty datetime strings
     for col in ("start_date_local", "start_date"):
         if col in df.columns:
             dt = pd.to_datetime(df[col], errors="coerce")
@@ -142,8 +179,12 @@ def normalize_activities(acts, gear_map):
         riders_lists = df["name"].apply(extract_riders_from_name)
         df["other_riders"] = riders_lists.apply(lambda lst: ", ".join(lst) if lst else "")
         df["other_riders_count"] = riders_lists.apply(len)
-        # also keep JSON list if you want
         df["other_riders_json"] = riders_lists.apply(lambda lst: json.dumps(lst) if lst else "[]")
+        total_mentions = int(df["other_riders_count"].sum())
+        activities_with_any = int((df["other_riders_count"] > 0).sum())
+        print(f"Rider parsing: {activities_with_any} activities contain riders; {total_mentions} rider names total.")
+    else:
+        print("Rider parsing skipped: 'name' or 'id' missing.")
     # Convert nested lists/dicts to JSON strings so Sheets can hold them
     for c in df.columns:
         if df[c].apply(lambda x: isinstance(x, (list, dict))).any():
@@ -155,15 +196,19 @@ def normalize_activities(acts, gear_map):
     return df
 
 def build_riders_long(df_activities: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+    cols = ["activity_id", "rider_name"]
     if "id" not in df_activities.columns or "other_riders" not in df_activities.columns:
-        return pd.DataFrame(columns=["activity_id","rider_name"])
+        print("riders_long: activities missing 'id' or 'other_riders'—returning empty.")
+        return pd.DataFrame(columns=cols)
+    rows = []
     for act_id, riders in zip(df_activities["id"], df_activities["other_riders"]):
         if not riders:
             continue
         for rider in [r.strip() for r in riders.split(",") if r.strip()]:
-            rows.append({"activity_id": act_id, "rider_name": rider})
-    return pd.DataFrame(rows)
+            rows.append({"activity_id": int(act_id), "rider_name": rider})
+    df = pd.DataFrame(rows, columns=cols)
+    print(f"riders_long rows: {len(df)}")
+    return df
 
 # ---------------- Google Sheets I/O ----------------
 def gspread_client_from_secret():
@@ -173,11 +218,19 @@ def gspread_client_from_secret():
     return gspread.authorize(creds)
 
 def write_df_to_tab(sh, title: str, df: pd.DataFrame):
+    # Ensure the worksheet exists
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows=str(max(len(df)+50, 200)), cols=str(max(26, len(df.columns)+5)))
     ws.clear()
+    if df.empty:
+        # Write headers so the tab always exists
+        headers = list(df.columns) if len(df.columns) > 0 else ["activity_id","rider_name"]
+        ws.update("A1", [headers])
+        ws.resize(rows=50, cols=max(5, len(headers)))
+        print(f"Wrote 0 rows to tab '{title}' (headers only).")
+        return
     set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
     print(f"Wrote {len(df)} rows x {len(df.columns)} cols to tab '{title}'.")
 
