@@ -1,0 +1,23 @@
+name: Strava → Google Sheets (rides)
+on:
+  workflow_dispatch: {}         # run on demand
+  schedule:
+    - cron: "0 9 * * *"         # daily 09:00 UTC (adjust if you like)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run pipeline
+        env:
+          STRAVA_CLIENT_ID:     ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+          STRAVA_REFRESH_TOKEN: ${{ secrets.STRAVA_REFRESH_TOKEN }}
+          SHEET_ID:             ${{ secrets.SHEET_ID }}
+          GCP_SVC_JSON:         ${{ secrets.GCP_SVC_JSON }}
+        run: python pipeline.py
