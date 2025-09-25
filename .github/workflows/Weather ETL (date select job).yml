@@ -76,4 +76,4 @@ jobs:
           WX_FLUSH_EVERY: ${{ inputs.flush_every }}
         run: |
           echo "[WX] Starting Weather ETL…"
-          python weather_etl2.py
+          python weather_etl.py
