@@ -1,0 +1,8 @@
+- name: Run Weather ETL
+  run: python weather_etl2.py
+  env:
+    GCP_SVC_JSON: ${{ secrets.GCP_SVC_JSON }}
+    SHEET_ID: ${{ secrets.SHEET_ID }}
+    WX_SINCE: "2025-06-01"      # <— limit scope for speed
+    WX_MAX_RIDES: "150"         # <— optional cap
+    WX_FLUSH_EVERY: "10"        # <— see rows appear more often
