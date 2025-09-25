@@ -1,5 +1,5 @@
-- name: Weather smoke test
-  run: python weather_smoke_test.py
-  env:
+name: Weather smoke test
+run: python weather_smoke_test.py
+env:
     HOME_LAT: ${{ secrets.HOME_LAT }}
     HOME_LON: ${{ secrets.HOME_LON }}
