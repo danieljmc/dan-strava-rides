@@ -240,7 +240,7 @@ def build_weather(sh):
             "lat": lat, "lon": lon,
             "avg_temp_f": temp_f_avg,
             "avg_cloudcover_pct": clouds_avg,
-            "avg_windspeed_ms": wind_s_avg,
+            "avg_windspeed_mph": wind_s_avg,
             "circmean_winddir_deg": wind_d_cmn,
             "hours_sampled": int(len(df_h))
         })
@@ -248,12 +248,14 @@ def build_weather(sh):
         time.sleep(THROTTLE_S)
 
     df_hourly = pd.concat(hourly_rows, ignore_index=True) if hourly_rows else pd.DataFrame(
-        columns=["activity_id","ride_start_local","ride_end_local","lat","lon",
-                 "time_local","temp_c","cloudcover_pct","windspeed_ms","winddir_deg","weathercode","temp_f"]
+    columns=["activity_id","ride_start_local","ride_end_local","lat","lon",
+             "time_local","temp_c","cloudcover_pct","windspeed_ms","windspeed_mph",
+             "winddir_deg","weathercode","temp_f"]
     )
+
     df_by_ride = pd.DataFrame(agg_rows, columns=[
         "activity_id","ride_start_local","ride_end_local","lat","lon",
-        "avg_temp_f","avg_cloudcover_pct","avg_windspeed_ms","circmean_winddir_deg","hours_sampled"
+        "avg_temp_f","avg_cloudcover_pct","avg_windspeed_mph","circmean_winddir_deg","hours_sampled"
     ])
 
     return df_hourly, df_by_ride
