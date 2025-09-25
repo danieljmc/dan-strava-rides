@@ -1,85 +1,24 @@
-# pipeline.py  (incremental + weather cache)
-# hardened datetime handling: tz normalization for both sides, drop bad rows before compare,
-# and extra guards around concat & empty frames; uses 'h' (not 'H').
-
-import os, json, time, re, math
-from datetime import timedelta
+# pipeline.py  (riders v5)
+import os, json, time, re
 import requests
-import numpy as np
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
 
 print("=== PIPELINE START ===")
-print("PIPELINE VERSION: inc+wx v1.1")
+print("PIPELINE VERSION: riders v5")
 
 # ---------------- Config ----------------
-PER_PAGE = 200  # Strava's max
+# NOTE: Strava caps per_page at 200 for /athlete/activities
+PER_PAGE = 200
+TAB_ACTIVITIES = "activities_all"   # wide table: all summary fields + parsed riders
+TAB_RIDERS_LONG = "riders_long"     # long table: (activity_id, rider_name)
 THROTTLE_S = 0.2
 ADD_GEAR_NAME = True
-INCLUDE_SOLO_PLACEHOLDER = True
+INCLUDE_SOLO_PLACEHOLDER = True     # add " Solo" rows for activities with no riders
 
-# Tabs
-TAB_ACTIVITIES   = "activities_all"   # wide activities
-TAB_RIDERS_LONG  = "riders_long"      # (activity_id, rider_name)
-TAB_WX_CACHE     = "weather_cache"    # hourly weather cache
-
-# Weather cache settings
-LATLON_ROUND = 1  # decimal places to round lat/lon for cache key (1 ≈ ~11 km)
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-OPEN_METEO_HOURLY = "temperature_2m,cloudcover,windspeed_10m,winddirection_10m,weathercode"
-
-# ---------------- Google Sheets I/O ----------------
-def gspread_client_from_secret():
-    svc_info = json.loads(os.environ["GCP_SVC_JSON"])
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(svc_info, scopes=scopes)
-    return gspread.authorize(creds)
-
-def open_sheet():
-    gc = gspread_client_from_secret()
-    return gc.open_by_key(os.environ["SHEET_ID"])
-
-def read_tab_df(sh, title: str) -> pd.DataFrame:
-    try:
-        ws = sh.worksheet(title)
-    except gspread.WorksheetNotFound:
-        return pd.DataFrame()
-    rows = ws.get_all_values()
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows[1:], columns=rows[0])
-    # try numeric conversion where possible (keep strings that look like times intact)
-    for c in df.columns:
-        if df[c].dtype == object and c not in {"time_iso"}:
-            try:
-                df[c] = pd.to_numeric(df[c])
-            except Exception:
-                pass
-    return df
-
-def write_df_to_tab(sh, title: str, df: pd.DataFrame):
-    try:
-        ws = sh.worksheet(title)
-    except gspread.WorksheetNotFound:
-        rows_n = (len(df) if df is not None else 0) + 200
-        cols_n = (len(df.columns) if (df is not None and hasattr(df, "columns")) else 1) + 5
-        ws = sh.add_worksheet(title=title, rows=str(max(rows_n, 200)), cols=str(max(26, cols_n)))
-    ws.clear()
-    if df is None or df.empty:
-        headers = list(df.columns) if df is not None and len(df.columns)>0 else ["_empty"]
-        ws.update("A1", [headers])
-        ws.resize(rows=50, cols=max(5, len(headers)))
-        print(f"Wrote 0 rows to tab '{title}' (headers only).")
-        return
-    set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
-    print(f"Wrote {len(df)} rows x {len(df.columns)} cols to tab '{title}'.")
-
-# ---------------- Strava auth + fetch ----------------
+# ---------------- Strava auth ----------------
 def get_strava_access_token():
     r = requests.post(
         "https://www.strava.com/oauth/token",
@@ -96,6 +35,7 @@ def get_strava_access_token():
     print("Strava token scope:", data.get("scope"))
     return data["access_token"]
 
+# ---------------- Fetch activities (summary) ----------------
 def fetch_all_activities(access_token):
     all_rows, page = [], 1
     while True:
@@ -116,6 +56,7 @@ def fetch_all_activities(access_token):
         time.sleep(THROTTLE_S)
     return all_rows
 
+# ---------------- Gear name map ----------------
 def fetch_gear_map(access_token):
     if not ADD_GEAR_NAME:
         return {}
@@ -132,24 +73,25 @@ def fetch_gear_map(access_token):
             m[bike["id"]] = bike.get("name") or bike.get("brand_name") or "Bike"
     for shoe in (data.get("shoes") or []):
         if shoe.get("id"):
-            m[shoe["id"]] = shoe.get("name") or shoe.get("brand_name") or "Shoes"
+            m[shoe["id"]] = bike.get("name") if False else shoe.get("name") or shoe.get("brand_name") or "Shoes"
     return m
 
 # ---------------- Riders parsing (strict "with" only) ----------------
 WITH_PATTERN = re.compile(r"\bwith\b", flags=re.IGNORECASE)
 
+# Stopwords (lowercase) — extended per your list
 STOPWORDS = {
-    # groups / family
+    # people-ish groups / family
     "family","boys","dad","mom","wife","husband","kids","scouts","troop","group","team","party","committee","club",
     # misc generic
     "home",
     # local places / common words
     "washington","tiverton","fall","river","sepowet","boy","scout","hill","buck","secondary",
-    # activity words
+    # already had many of these in earlier versions
     "solo","loop","ride","walk","hike","skate","skating","biking","cycling","trainer","activity",
     "morning","afternoon","evening","lunch","first","return","reverse","leisurely","slow",
     "rd","road","street","blvd","park","path","trail","drive","point","beach","lake","falls","notch",
-    "green","bridge","bridges","campground","maze","summit",
+    "green","bridge","bridges","river","coast","campground","maze","summit",
     "north","south","east","west",
     "ebbp","nh","ri","fl",
     "newport","providence","sakonnet","sakonnett","acoaxet","bulgamarsh","horseneck",
@@ -157,7 +99,7 @@ STOPWORDS = {
     "bristol","portsmouth","lincoln","waterville","valley","kancamagus","conway","taunton",
 }
 
-KEEP_PAREN_PHRASES = False
+KEEP_PAREN_PHRASES = False  # set True if you want "(the boys)" kept as "the boys"
 
 def strip_parens(t: str) -> str:
     t = t.strip()
@@ -167,6 +109,7 @@ def strip_parens(t: str) -> str:
     return t
 
 def clean_token(w: str) -> str:
+    # Remove leading/trailing non-letters (handles "Becky!" -> "Becky", "Gregg)" -> "Gregg")
     w = w.strip()
     w = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", w)
     return w
@@ -179,6 +122,7 @@ def is_name_token(tok: str) -> bool:
     lt = tok.lower()
     if lt in STOPWORDS:
         return False
+    # must look like a proper name token (Titlecase single word)
     return tok[0].isupper() and tok[1:].islower()
 
 def split_by_commas_and_and(s: str) -> list[str]:
@@ -192,9 +136,11 @@ def tokenize_names_after_with(segment: str) -> list[str]:
         core = strip_parens(part)
         for w in core.split():
             w = clean_token(w)
-            if not w: continue
+            if not w:
+                continue
             if is_name_token(w):
                 out.append(w.title())
+    # de-dup, preserve order
     seen, uniq = set(), []
     for t in out:
         if t not in seen:
@@ -202,6 +148,7 @@ def tokenize_names_after_with(segment: str) -> list[str]:
     return uniq
 
 def extract_riders_from_name(activity_name: str) -> list[str]:
+    """STRICT: only parse names in the substring after 'with'."""
     if not activity_name:
         return []
     m = WITH_PATTERN.search(activity_name)
@@ -210,364 +157,110 @@ def extract_riders_from_name(activity_name: str) -> list[str]:
     after = activity_name[m.end():]
     return tokenize_names_after_with(after)
 
-# ---------------- Weather helpers ----------------
-def round_latlon(lat, lon, places=LATLON_ROUND):
-    return (round(float(lat), places), round(float(lon), places))
-
-def om_fetch_hourly(lat, lon, date_iso):
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": OPEN_METEO_HOURLY,
-        "start_date": date_iso,
-        "end_date": date_iso,
-        "timezone": "auto",
-    }
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=60)
-    if r.status_code == 429:
-        print("Open-Meteo rate limited; sleeping 60s..."); time.sleep(60)
-        r = requests.get(OPEN_METEO_URL, params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-def circular_mean_deg(deg_list):
-    if not deg_list:
-        return None
-    rad = np.deg2rad(deg_list)
-    s = np.mean(np.sin(rad))
-    c = np.mean(np.cos(rad))
-    mean = math.degrees(math.atan2(s, c))
-    if mean < 0:
-        mean += 360.0
-    return mean
-
-def wx_condition_from(hour_cc_list, hour_codes):
-    rainy_codes = {51,53,55,56,57,61,63,65,66,67,80,81,82}
-    snowy_codes = {71,73,75,77,85,86}
-    if any(code in snowy_codes for code in hour_codes):
-        return "Snowy"
-    if any(code in rainy_codes for code in hour_codes):
-        return "Rainy"
-    avg_cc = np.mean(hour_cc_list) if hour_cc_list else 0.0
-    return "Cloudy" if avg_cc >= 50 else "Sunny"
-
-# ---------------- Normalize activities (summary) ----------------
+# ---------------- Flatten + enrich ----------------
 def normalize_activities(acts, gear_map):
     df = pd.json_normalize(acts, sep=".")
-    # Datetimes
-    if "start_date_local" in df.columns:
-        dt = pd.to_datetime(df["start_date_local"], errors="coerce")
-        df["start_date_local_fmt"] = dt.dt.strftime("%Y-%m-%d %H:%M:%S")
-    if "start_date" in df.columns:
-        dt2 = pd.to_datetime(df["start_date"], errors="coerce")
-        df["start_date_fmt"] = dt2.dt.strftime("%Y-%m-%d %H:%M:%S")
-    # Gear
+    # datetime
+    for col in ("start_date_local", "start_date"):
+        if col in df.columns:
+            dt = pd.to_datetime(df[col], errors="coerce")
+            df[col + "_fmt"] = dt.dt.strftime("%Y-%m-%d %H:%M:%S")
+    # gear
     if "gear_id" in df.columns:
         df["gear_name"] = df["gear_id"].map(lambda g: gear_map.get(g) if gear_map else None)
-    # Riders
+    # riders
     if "name" in df.columns and "id" in df.columns:
+        print("normalize_activities: 'name' and 'id' columns present.")
         riders_lists = df["name"].apply(extract_riders_from_name)
         df["other_riders"] = riders_lists.apply(lambda lst: ", ".join(lst) if lst else "")
         df["other_riders_count"] = riders_lists.apply(len)
         df["other_riders_json"] = riders_lists.apply(lambda lst: json.dumps(lst) if lst else "[]")
-    # Sort
+        total_mentions = int(df["other_riders_count"].sum())
+        activities_with_any = int((df["other_riders_count"] > 0).sum())
+        print(f"Rider parsing: {activities_with_any} activities contain riders; {total_mentions} rider names total.")
+        sample = df.loc[df["other_riders_count"] > 0, ["name","other_riders"]].head(5)
+        if not sample.empty:
+            print("Sample parsed riders:\n", sample.to_string(index=False))
+    else:
+        print("normalize_activities: MISSING 'name' or 'id' — rider parsing skipped.")
+    # lists/dicts -> JSON strings
+    for c in df.columns:
+        if df[c].apply(lambda x: isinstance(x, (list, dict))).any():
+            df[c] = df[c].apply(lambda v: json.dumps(v) if isinstance(v, (list, dict)) else v)
+    # sort
     sort_col = "start_date_local" if "start_date_local" in df.columns else ("start_date" if "start_date" in df.columns else None)
     if sort_col:
         df = df.sort_values(sort_col, ascending=False, kind="mergesort")
     return df
 
-def build_riders_long(df_acts: pd.DataFrame) -> pd.DataFrame:
+def build_riders_long(df_activities: pd.DataFrame) -> pd.DataFrame:
     cols = ["activity_id", "rider_name"]
-    if df_acts.empty or "id" not in df_acts.columns:
+    if "id" not in df_activities.columns or "other_riders" not in df_activities.columns:
+        print("riders_long: missing 'id' or 'other_riders'; returning empty.")
         return pd.DataFrame(columns=cols)
+
     rows = []
-    has_cols = "other_riders" in df_acts.columns and "other_riders_count" in df_acts.columns
-    if has_cols:
-        for act_id, riders, cnt in zip(df_acts["id"], df_acts["other_riders"], df_acts["other_riders_count"]):
-            if cnt and riders:
-                for rider in [r.strip() for r in riders.split(",") if r.strip()]:
-                    rows.append({"activity_id": int(act_id), "rider_name": rider})
-    # Solo placeholder
+    # Rows for activities that DO have riders
+    for act_id, riders in zip(df_activities["id"], df_activities["other_riders"]):
+        if riders:
+            for rider in [r.strip() for r in riders.split(",") if r.strip()]:
+                rows.append({"activity_id": int(act_id), "rider_name": rider})
+
+    # Optional: add a synthetic " Solo" row for truly solo rides
     if INCLUDE_SOLO_PLACEHOLDER:
-        solo_ids = df_acts.loc[df_acts.get("other_riders_count", pd.Series([0]*len(df_acts))).fillna(0) == 0, "id"]
+        solo_mask = (df_activities["other_riders_count"].fillna(0) == 0) | (df_activities["other_riders"].fillna("") == "")
+        solo_ids = df_activities.loc[solo_mask, "id"]
         for act_id in solo_ids:
             rows.append({"activity_id": int(act_id), "rider_name": " Solo"})
+
     df = pd.DataFrame(rows, columns=cols)
+    print(f"riders_long rows: {len(df)} (includes ' Solo' placeholders: {INCLUDE_SOLO_PLACEHOLDER})")
     return df
 
-# ---------------- Incremental merge helpers ----------------
-def merge_incremental(existing: pd.DataFrame, incoming: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns (combined_df, new_rows_df)
-    - existing: current activities_all from Sheets
-    - incoming: fresh from Strava
-    """
-    if existing is None or existing.empty:
-        return incoming.copy(), incoming.copy()
+# ---------------- Google Sheets I/O ----------------
+def gspread_client_from_secret():
+    svc_info = json.loads(os.environ["GCP_SVC_JSON"])
+    # Include Drive scope (helps in some environments / shared drives)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = Credentials.from_service_account_info(svc_info, scopes=scopes)
+    return gspread.authorize(creds)
 
-    for df in (existing, incoming):
-        if "id" in df.columns:
-            df["id"] = pd.to_numeric(df["id"], errors="coerce")
-
-    existing_ids = set(existing["id"].dropna().astype(int).tolist()) if "id" in existing.columns else set()
-
-    if incoming is None or incoming.empty:
-        combined = existing.copy()
-        new_rows = incoming.copy() if incoming is not None else pd.DataFrame(columns=existing.columns)
-        return combined, new_rows
-
-    incoming["is_new"] = ~incoming["id"].astype("Int64").isin(existing_ids)
-    new_rows = incoming[incoming["is_new"]].drop(columns=["is_new"]).copy()
-
-    frames = []
-    if existing is not None and not existing.empty:
-        frames.append(existing)
-    if new_rows is not None and not new_rows.empty:
-        frames.append(new_rows)
-    if frames:
-        combined = pd.concat(frames, ignore_index=True, sort=False)
-    else:
-        combined = incoming.head(0).copy()
-    return combined, new_rows
-
-# ---------------- Weather cache load/save ----------------
-def load_weather_cache(sh) -> pd.DataFrame:
-    df = read_tab_df(sh, TAB_WX_CACHE)
-    if df.empty:
-        return pd.DataFrame(columns=[
-            "date", "lat_round", "lon_round",
-            "time_iso", "temperature_2m", "cloudcover", "windspeed_10m", "winddirection_10m", "weathercode"
-        ])
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-    if "time_iso" in df.columns:
-        df["time_iso"] = df["time_iso"].astype(str)
-        # normalize some common weirds (e.g., 'None', '', 'nan')
-        df.loc[~df["time_iso"].str.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", na=False), "time_iso"] = np.nan
-    for col in ["lat_round","lon_round","temperature_2m","cloudcover","windspeed_10m","winddirection_10m","weathercode"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-def append_to_weather_cache(cache_df: pd.DataFrame, lat_r: float, lon_r: float, date_iso: str, hourly: dict) -> pd.DataFrame:
-    times = hourly.get("time", []) or []
-    temps = hourly.get("temperature_2m", []) or []
-    cc    = hourly.get("cloudcover", []) or []
-    ws    = hourly.get("windspeed_10m", []) or []
-    wd    = hourly.get("winddirection_10m", []) or []
-    wc    = hourly.get("weathercode", []) or []
-    rows = []
-    for t, T, C, S, D, W in zip(times, temps, cc, ws, wd, wc):
-        rows.append({
-            "date": pd.to_datetime(date_iso, errors="coerce").date(),
-            "lat_round": lat_r, "lon_round": lon_r,
-            "time_iso": t,
-            "temperature_2m": T,
-            "cloudcover": C,
-            "windspeed_10m": S,
-            "winddirection_10m": D,
-            "weathercode": W,
-        })
-    add_df = pd.DataFrame(rows)
-    if add_df.empty:
-        return cache_df
-    if cache_df is None or cache_df.empty:
-        updated = add_df.copy()
-    else:
-        updated = pd.concat([cache_df, add_df], ignore_index=True)
-    return updated
-
-def ensure_hour_in_cache(cache_df: pd.DataFrame, lat_r: float, lon_r: float, date_iso: str) -> pd.DataFrame:
-    date_only = pd.to_datetime(date_iso, errors="coerce").date()
-    if cache_df is not None and not cache_df.empty:
-        sub = cache_df[
-            (cache_df["lat_round"] == lat_r) &
-            (cache_df["lon_round"] == lon_r) &
-            (cache_df["date"] == date_only)
-        ]
-        if len(sub) >= 24:
-            return cache_df
-    data = om_fetch_hourly(lat_r, lon_r, date_iso)
-    hourly = data.get("hourly", {})
-    cache_df = append_to_weather_cache(cache_df, lat_r, lon_r, date_iso, hourly)
-    time.sleep(0.2)
-    return cache_df
-
-# ---- Datetime normalization helpers ----
-def _to_naive_datetime_series(s: pd.Series) -> pd.Series:
-    """
-    Parse timestamps (tz-aware or naive) -> UTC -> strip tz, returning tz-naive.
-    Drops invalid rows (NaT) later in the caller before comparison.
-    """
-    dt = pd.to_datetime(s, errors="coerce", utc=True)
-    # dt is tz-aware (UTC). Convert to tz-naive in wall-clock UTC.
-    return dt.dt.tz_convert(None)
-
-def _to_naive_ts(ts) -> pd.Timestamp:
-    """Parse single timestamp (string/ts) to tz-naive (via UTC)."""
-    t = pd.to_datetime(ts, errors="coerce", utc=True)
-    if pd.isna(t):
-        return t
-    return t.tz_convert(None)
-
-# ---------------- Weather enrichment per activity ----------------
-def parse_start_latlon(row):
-    v = row.get("start_latlng", None)
-    if isinstance(v, list) and len(v) == 2:
-        return float(v[0]), float(v[1])
-    if isinstance(v, str) and "," in v:
-        try:
-            lat_s, lon_s = v.split(",", 1)
-            return float(lat_s.strip()), float(lon_s.strip())
-        except Exception:
-            pass
-    home_lat = float(os.getenv("HOME_LAT", "41.636"))
-    home_lon = float(os.getenv("HOME_LON", "-71.176"))
-    return home_lat, home_lon
-
-def compute_wx_for_activity(row, cache_df: pd.DataFrame):
-    # Start/end time in LOCAL; normalize via UTC->naive for consistent comparison
-    start = _to_naive_ts(row.get("start_date_local"))
-    if pd.isna(start):
-        return None
-    secs = pd.to_numeric(row.get("elapsed_time"), errors="coerce")
-    if pd.isna(secs):
-        return None
-    end = start + timedelta(seconds=float(secs))
-
-    lat, lon = parse_start_latlon(row)
-    lat_r, lon_r = round_latlon(lat, lon)
-
-    # Which dates to cover (handles rides that cross midnight)
-    days = pd.date_range(start.normalize(), end.normalize(), freq="D").date
-
-    # Ensure cache has all needed hourly rows for each date
-    for d in days:
-        cache_df = ensure_hour_in_cache(cache_df, lat_r, lon_r, pd.Timestamp(d).date().isoformat())
-
-    if cache_df is None or cache_df.empty:
-        return None
-
-    # Pull relevant hours subset across dates within [start, end]
-    mask = (
-        (cache_df["lat_round"] == lat_r) &
-        (cache_df["lon_round"] == lon_r) &
-        (cache_df["date"].isin(days))
-    )
-    subset = cache_df.loc[mask].copy()
-    if subset.empty:
-        return None
-
-    # Normalize cache times, and drop bad/blank ones before compare
-    subset["t"] = _to_naive_datetime_series(subset["time_iso"])
-    subset = subset.dropna(subset=["t"])
-
-    if subset.empty:
-        return None
-
-    # Use lowercase 'h' (pandas deprecation fix)
-    left = start.floor("h")
-    right = end.ceil("h")
+def write_df_to_tab(sh, title: str, df: pd.DataFrame):
     try:
-        in_window = subset[(subset["t"] >= left) & (subset["t"] <= right)]
-    except Exception as e:
-        # As a last resort, compare as numpy datetime64[ns] (fully naive)
-        subset["t64"] = subset["t"].values.astype("datetime64[ns]")
-        left64 = np.datetime64(left.to_pydatetime())
-        right64 = np.datetime64(right.to_pydatetime())
-        in_window = subset[(subset["t64"] >= left64) & (subset["t64"] <= right64)]
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=str(max(len(df)+50, 200)), cols=str(max(26, len(df.columns)+5)))
+    ws.clear()
+    if df.empty:
+        headers = list(df.columns) if len(df.columns) > 0 else ["activity_id","rider_name"]
+        ws.update("A1", [headers])
+        ws.resize(rows=50, cols=max(5, len(headers)))
+        print(f"Wrote 0 rows to tab '{title}' (headers only).")
+        return
+    set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
+    print(f"Wrote {len(df)} rows x {len(df.columns)} cols to tab '{title}'.")
 
-    if in_window.empty:
-        return None
-
-    temps_c = pd.to_numeric(in_window["temperature_2m"], errors="coerce").dropna().tolist()
-    clouds  = pd.to_numeric(in_window["cloudcover"], errors="coerce").dropna().tolist()
-    ws_ms   = pd.to_numeric(in_window["windspeed_10m"], errors="coerce").dropna().tolist()
-    wd_deg  = pd.to_numeric(in_window["winddirection_10m"], errors="coerce").dropna().tolist()
-    codes   = pd.to_numeric(in_window["weathercode"], errors="coerce").dropna().astype(int).tolist()
-
-    if not temps_c:
-        return None
-
-    temp_c_avg = float(np.mean(temps_c))
-    temp_f_avg = temp_c_avg * 9/5 + 32.0
-    wind_mps_avg = float(np.mean(ws_ms)) if ws_ms else None
-    wind_mph_avg = wind_mps_avg * 2.23694 if wind_mps_avg is not None else None
-    wind_dir_avg = circular_mean_deg(wd_deg) if wd_deg else None
-    condition = wx_condition_from(clouds, codes)
-
-    return {
-        "wx_temp_avg_f": round(temp_f_avg, 1),
-        "wx_wind_speed_avg_mph": round(wind_mph_avg, 1) if wind_mph_avg is not None else None,
-        "wx_wind_dir_avg_deg": round(wind_dir_avg, 0) if wind_dir_avg is not None else None,
-        "wx_condition": condition,
-    }, cache_df
-
-def enrich_missing_weather(df_acts: pd.DataFrame, cache_df: pd.DataFrame):
-    need_cols = ["wx_temp_avg_f","wx_wind_speed_avg_mph","wx_wind_dir_avg_deg","wx_condition"]
-    # Identify rows missing any weather column
-    missing_mask = pd.Series(False, index=df_acts.index)
-    for c in need_cols:
-        if c not in df_acts.columns:
-            df_acts[c] = None
-        missing_mask = missing_mask | df_acts[c].isna() | (df_acts[c] == "")
-    todo = df_acts[missing_mask].copy()
-    print(f"Weather: {len(todo)} activities missing weather → computing…")
-
-    updated = 0
-    for idx, row in todo.iterrows():
-        res = compute_wx_for_activity(row, cache_df)
-        if res is None:
-            continue
-        vals, cache_df = res
-        for k, v in vals.items():
-            df_acts.at[idx, k] = v
-        updated += 1
-        if updated % 10 == 0:
-            print(f"  …updated {updated} activities")
-        time.sleep(0.05)
-    print(f"Weather: filled {updated} activities.")
-    return df_acts, cache_df
+def write_dataframes_to_sheet(df_acts: pd.DataFrame, df_riders: pd.DataFrame):
+    gc = gspread_client_from_secret()
+    sh = gc.open_by_key(os.environ["SHEET_ID"])
+    # Write riders first so logs are easy to see
+    write_df_to_tab(sh, TAB_RIDERS_LONG, df_riders)
+    write_df_to_tab(sh, TAB_ACTIVITIES, df_acts)
+    # Final debug: list tabs present
+    titles = [ws.title for ws in sh.worksheets()]
+    print("Worksheets now present:", titles)
 
 # ---------------- Main ----------------
 def main():
-    sh = open_sheet()
-
-    # Load existing activities (if any)
-    df_existing = read_tab_df(sh, TAB_ACTIVITIES)
-    if not df_existing.empty and "id" in df_existing.columns:
-        df_existing["id"] = pd.to_numeric(df_existing["id"], errors="coerce")
-
-    # Fetch fresh from Strava
     token = get_strava_access_token()
     gear_map = fetch_gear_map(token)
     acts = fetch_all_activities(token)
-    df_incoming = normalize_activities(acts, gear_map)
-
-    # Incremental merge
-    if df_existing.empty:
-        df_combined = df_incoming.copy()
-        df_new = df_incoming.copy()
-        print(f"Incremental: sheet empty → will write {len(df_combined)} activities.")
-    else:
-        df_combined, df_new = merge_incremental(df_existing, df_incoming)
-        print(f"Incremental: {len(df_new)} new activities (total now {len(df_combined)}).")
-
-    # Riders long (rebuilt from combined for consistency)
-    df_riders = build_riders_long(df_combined)
-
-    # Weather cache load/update + enrich weather for activities missing wx fields
-    df_cache = load_weather_cache(sh)
-    df_combined, df_cache = enrich_missing_weather(df_combined, df_cache)
-
-    # Write tabs
-    write_df_to_tab(sh, TAB_WX_CACHE, df_cache)
-    write_df_to_tab(sh, TAB_RIDERS_LONG, df_riders)
-    write_df_to_tab(sh, TAB_ACTIVITIES, df_combined)
-
-    # Final summary
-    titles = [ws.title for ws in sh.worksheets()]
-    print("Worksheets present:", titles)
+    df_acts = normalize_activities(acts, gear_map)
+    df_riders = build_riders_long(df_acts)
+    write_dataframes_to_sheet(df_acts, df_riders)
 
 if __name__ == "__main__":
     main()
