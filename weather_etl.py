@@ -1,5 +1,5 @@
 # weather_etl.py — pull hourly weather for each ride window and write to Google Sheets
-import os, json, math, time
+import os, json, math, time, re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 
@@ -107,24 +107,57 @@ def fetch_open_meteo_hourly(lat: float, lon: float, start_date_iso: str, end_dat
     r.raise_for_status()
     return r.json()
 
+# ---------------- Time helpers ----------------
+_TZ_RE = re.compile(r"([A-Za-z]+/[A-Za-z_]+)$")
+
+def extract_tz_name(tz_field: Optional[str]) -> Optional[str]:
+    """Extract IANA time zone from strings like '(GMT-05:00) America/New_York' -> 'America/New_York'."""
+    if not tz_field or not isinstance(tz_field, str):
+        return None
+    m = _TZ_RE.search(tz_field.strip())
+    return m.group(1) if m else None
+
+def to_local_naive_from_sheet_value(ts_val, tz_field: Optional[str]) -> Optional[datetime]:
+    """
+    Convert a sheet value in 'start_date_local' to a TRUE local, tz-naive datetime using the sheet's timezone.
+    - If ts_val contains 'Z' or an offset -> treat as UTC, convert to tz_field, drop tz.
+    - Else -> parse as naive and assume it's already local wall clock.
+    """
+    tzname = extract_tz_name(tz_field)
+    if ts_val is None or (isinstance(ts_val, float) and np.isnan(ts_val)):
+        return None
+    s = str(ts_val)
+    # If looks like ISO with Z/offset, treat as UTC-aware then convert
+    if "Z" in s or "+" in s or s.endswith("Z"):
+        ts = pd.to_datetime(s, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        if tzname:
+            ts_local = ts.tz_convert(tzname)
+        else:
+            ts_local = ts  # leave in UTC if no tz
+        return ts_local.tz_localize(None).to_pydatetime()
+    # otherwise, parse as naive
+    ts = pd.to_datetime(s, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.to_pydatetime()
+
 def to_utc_naive(ts: datetime, tzname: Optional[str]) -> datetime:
     """
-    Convert a timestamp to UTC-naive:
-      - if ts is tz-aware: tz_convert('UTC') and drop tz
-      - if ts is tz-naive: tz_localize(tzname) -> tz_convert('UTC') -> drop tz
+    Convert any datetime to UTC-naive for comparisons.
+    - If tz-aware: tz_convert('UTC') -> drop tz
+    - If naive : tz_localize(tzname or 'UTC') -> tz_convert('UTC') -> drop tz
     """
     ts_pd = pd.Timestamp(ts)
     if ts_pd.tz is not None:
-        ts_utc = ts_pd.tz_convert("UTC")
-        return ts_utc.tz_localize(None).to_pydatetime()
-    # tz-naive path
+        return ts_pd.tz_convert("UTC").tz_localize(None).to_pydatetime()
     if tzname:
         try:
             ts_local = ts_pd.tz_localize(tzname, nonexistent="shift_forward", ambiguous="NaT")
             if pd.isna(ts_local):
                 ts_local = ts_pd.tz_localize(tzname, nonexistent="shift_forward", ambiguous=True)
         except Exception:
-            # last resort: assume it's already UTC wall clock
             ts_local = ts_pd.tz_localize("UTC")
     else:
         ts_local = ts_pd.tz_localize("UTC")
@@ -137,7 +170,7 @@ def build_weather(sh):
         print(f"{PRINT_PREFIX} activities_all is empty; nothing to do.")
         return pd.DataFrame(), pd.DataFrame()
 
-    needed = {"id", "start_date_local", "elapsed_time", "start_latlng"}
+    needed = {"id", "start_date_local", "elapsed_time", "start_latlng", "timezone"}
     missing = [c for c in needed if c not in df_acts.columns]
     if missing:
         raise ValueError(f"Missing required columns in {TAB_ACTIVITIES}: {missing}")
@@ -145,8 +178,13 @@ def build_weather(sh):
     df = df_acts.copy()
     df["activity_id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
     df["elapsed_time_s"] = pd.to_numeric(df["elapsed_time"], errors="coerce")
-    # start_date_local may be tz-naive or tz-aware depending on how the sheet stored it
-    df["start_dt_local"] = pd.to_datetime(df["start_date_local"], errors="coerce")
+    df["tz_name"] = df["timezone"].apply(extract_tz_name)
+
+    # TRUE local tz-naive start from the sheet values (which look UTC with Z)
+    df["start_dt_local"] = [
+        to_local_naive_from_sheet_value(ts_val, tz_field)
+        for ts_val, tz_field in zip(df["start_date_local"], df["timezone"])
+    ]
 
     latlons = df["start_latlng"].apply(parse_latlon)
     df["lat"] = latlons.apply(lambda t: t[0] if t else np.nan)
@@ -154,7 +192,7 @@ def build_weather(sh):
 
     elig = df[
         df["activity_id"].notna()
-        & df["start_dt_local"].notna()
+        & pd.notna(df["start_dt_local"])
         & df["elapsed_time_s"].notna()
         & df["lat"].notna()
         & df["lon"].notna()
@@ -169,11 +207,12 @@ def build_weather(sh):
 
     for _, row in elig.iterrows():
         aid = int(row["activity_id"])
-        start_dt_local: datetime = row["start_dt_local"].to_pydatetime()
+        tzname = row["tz_name"] or "UTC"
+        start_dt_local: datetime = row["start_dt_local"]
         end_dt_local: datetime = start_dt_local + timedelta(seconds=float(row["elapsed_time_s"]))
         lat, lon = float(row["lat"]), float(row["lon"])
 
-        # Span the involved local dates for the OM call
+        # Query OM across the involved DATES (local wall clock range)
         start_day = start_dt_local.date()
         end_day   = end_dt_local.date()
         om_start = start_day.isoformat()
@@ -185,8 +224,8 @@ def build_weather(sh):
             print(f"{PRINT_PREFIX} OM error for activity {aid}: {e}")
             continue
 
-        # OM metadata timezone, e.g. "America/New_York"
-        om_tz = data.get("timezone") or "UTC"
+        # OM timezone (e.g., "America/New_York"); fallback to sheet tz if missing
+        om_tz = data.get("timezone") or tzname
 
         hourly = data.get("hourly", {})
         times  = hourly.get("time", [])
@@ -196,14 +235,14 @@ def build_weather(sh):
         wind_d = hourly.get("winddirection_10m", [])
         codes  = hourly.get("weathercode", [])
 
-        # Parse OM times as tz-aware → UTC → tz-naive (Series so we can use .tz_* accessors)
+        # Parse OM times as tz-aware → UTC → tz-naive (Series so .tz_* works)
         times_utc_naive = pd.Series(pd.to_datetime(times, utc=True).tz_convert("UTC").tz_localize(None))
 
-        # Convert ride window to UTC-naive
-        start_utc_naive = to_utc_naive(start_dt_local, om_tz)
-        end_utc_naive   = to_utc_naive(end_dt_local,   om_tz)
+        # Convert ride window to UTC-naive using the sheet/OM tz
+        start_utc_naive = to_utc_naive(start_dt_local, tzname or om_tz)
+        end_utc_naive   = to_utc_naive(end_dt_local,   tzname or om_tz)
 
-        # Build per-hour DataFrame in UTC-naive clock for comparisons
+        # Build per-hour DataFrame in UTC-naive for comparisons
         df_h = pd.DataFrame({
             "time_utc": times_utc_naive,
             "temp_c": pd.to_numeric(temp_c, errors="coerce"),
@@ -223,7 +262,7 @@ def build_weather(sh):
             # If nothing intersects (very short rides), take the first hour at/after start
             nearest_mask = (times_utc_naive >= start_floor_utc)
             if nearest_mask.any():
-                idx = list(nearest_mask).index(True)
+                idx = int(np.argmax(nearest_mask.values))
                 df_h = pd.DataFrame({
                     "time_utc": [times_utc_naive.iloc[idx]],
                     "temp_c": [pd.to_numeric(temp_c[idx], errors="coerce")],
