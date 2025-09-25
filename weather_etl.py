@@ -97,7 +97,7 @@ def fetch_open_meteo_hourly(lat: float, lon: float, start_date_iso: str, end_dat
         "hourly": "temperature_2m,cloudcover,windspeed_10m,winddirection_10m,weathercode",
         "start_date": start_date_iso,
         "end_date": end_date_iso,
-        "timezone": "auto",  # OM returns times with tz info + returns a 'timezone' field
+        "timezone": "auto",  # OM returns tz-aware times + a 'timezone' field
     }
     r = requests.get(OPEN_METEO_URL, params=params, timeout=60)
     if r.status_code == 429:
@@ -114,14 +114,11 @@ def to_utc_naive(ts: datetime, tzname: Optional[str]) -> datetime:
     """
     ts_pd = pd.Timestamp(ts)
     if tzname:
-        # Handle DST edge cases
         try:
             ts_local = ts_pd.tz_localize(tzname, nonexistent="shift_forward", ambiguous="NaT")
             if pd.isna(ts_local):
-                # Fallback if ambiguous became NaT: assume 'ambiguous=True'
                 ts_local = ts_pd.tz_localize(tzname, nonexistent="shift_forward", ambiguous=True)
         except Exception:
-            # As a last resort, assume local wall clock is already in UTC offset 0
             ts_local = ts_pd.tz_localize("UTC")
     else:
         ts_local = ts_pd.tz_localize("UTC")
@@ -194,8 +191,8 @@ def build_weather(sh):
         wind_d = hourly.get("winddirection_10m", [])
         codes  = hourly.get("weathercode", [])
 
-        # Parse OM times as tz-aware (respect +00:00 or zone offset), then convert to UTC and strip tz
-        times_utc_naive = pd.to_datetime(times, utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+        # Parse OM times as tz-aware → UTC → tz-naive
+        times_utc_naive = pd.Series(pd.to_datetime(times, utc=True).tz_convert("UTC").tz_localize(None))
 
         # Convert ride window to UTC-naive
         start_utc_naive = to_utc_naive(start_dt_local, om_tz)
@@ -245,8 +242,7 @@ def build_weather(sh):
         df_h.insert(2, "ride_end_local", end_dt_local)
         df_h.insert(3, "lat", lat)
         df_h.insert(4, "lon", lon)
-        # optional: also include the UTC window used
-        df_h.insert(5, "time_utc", df_h.pop("time_utc"))
+        # time_utc is already present as a column
 
         hourly_rows.append(df_h)
 
