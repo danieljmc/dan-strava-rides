@@ -1,5 +1,6 @@
-requests
-gspread
-google-auth
-gspread-dataframe
-pandas
+pandas>=2.2.2,<3
+numpy>=1.26,<3
+requests>=2.32
+gspread>=6.1.0
+gspread-dataframe>=3.3.1
+google-auth>=2.29
