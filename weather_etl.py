@@ -30,7 +30,12 @@ def gspread_client_from_secret():
 
 def read_tab_to_df(sh, title: str) -> pd.DataFrame:
     ws = sh.worksheet(title)
-    data = ws.get_all_records(numeric_value_strategy="RAW")
+    # Back-compatible call: older gspread lacks numeric_value_strategy
+    try:
+        data = ws.get_all_records(numeric_value_strategy="RAW")
+    except TypeError:
+        # Fallback for older gspread — returns best-effort typing
+        data = ws.get_all_records()
     return pd.DataFrame(data)
 
 def write_df_to_tab(sh, title: str, df: pd.DataFrame):
@@ -59,7 +64,6 @@ def circular_mean_deg(deg_series: pd.Series) -> Optional[float]:
     vals = pd.to_numeric(deg_series, errors="coerce").dropna().values
     if len(vals) == 0:
         return None
-    # convert to radians
     rad = np.deg2rad(vals)
     s = np.sin(rad).sum()
     c = np.cos(rad).sum()
@@ -81,7 +85,6 @@ def parse_latlon(start_latlng_val) -> Optional[Tuple[float, float]]:
         if not isinstance(arr, (list, tuple)) or len(arr) < 2:
             return None
         lat = float(arr[0]); lon = float(arr[1])
-        # Filter clearly invalid lat/lon
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             return None
         return lat, lon
@@ -105,12 +108,6 @@ def fetch_open_meteo_hourly(lat: float, lon: float, start_date_iso: str, end_dat
     r.raise_for_status()
     return r.json()
 
-def ensure_datetime(x) -> Optional[datetime]:
-    try:
-        return pd.to_datetime(x).to_pydatetime()
-    except Exception:
-        return None
-
 # ---------------- Core ETL ----------------
 def build_weather(sh):
     df_acts = read_tab_to_df(sh, TAB_ACTIVITIES)
@@ -118,24 +115,20 @@ def build_weather(sh):
         print(f"{PRINT_PREFIX} activities_all is empty; nothing to do.")
         return pd.DataFrame(), pd.DataFrame()
 
-    # Required columns check
     needed = {"id", "start_date_local", "elapsed_time", "start_latlng"}
     missing = [c for c in needed if c not in df_acts.columns]
     if missing:
         raise ValueError(f"Missing required columns in {TAB_ACTIVITIES}: {missing}")
 
-    # Parse types
     df = df_acts.copy()
     df["activity_id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
     df["elapsed_time_s"] = pd.to_numeric(df["elapsed_time"], errors="coerce")
     df["start_dt_local"] = pd.to_datetime(df["start_date_local"], errors="coerce")
 
-    # Parse lat/lon
     latlons = df["start_latlng"].apply(parse_latlon)
     df["lat"] = latlons.apply(lambda t: t[0] if t else np.nan)
     df["lon"] = latlons.apply(lambda t: t[1] if t else np.nan)
 
-    # Filter eligible activities
     elig = df[
         df["activity_id"].notna()
         & df["start_dt_local"].notna()
@@ -157,7 +150,6 @@ def build_weather(sh):
         end_dt: datetime = start_dt + timedelta(seconds=float(row["elapsed_time_s"]))
         lat, lon = float(row["lat"]), float(row["lon"])
 
-        # Get full-day coverage across the ride window; OM returns local times with 'timezone=auto'
         start_day = start_dt.date()
         end_day   = end_dt.date()
         om_start = start_day.isoformat()
@@ -177,7 +169,6 @@ def build_weather(sh):
         wind_d = hourly.get("winddirection_10m", [])
         codes  = hourly.get("weathercode", [])
 
-        # Build DataFrame and clip to the ride window (inclusive start, inclusive end hour)
         df_h = pd.DataFrame({
             "time_local": pd.to_datetime(times, errors="coerce"),
             "temp_c": pd.to_numeric(temp_c, errors="coerce"),
@@ -187,13 +178,11 @@ def build_weather(sh):
             "weathercode": pd.to_numeric(codes, errors="coerce")
         }).dropna(subset=["time_local"])
 
-        # Keep only hours that intersect [start_dt, end_dt]
         mask = (df_h["time_local"] >= start_dt.replace(minute=0, second=0, microsecond=0)) & \
                (df_h["time_local"] <= end_dt.replace(minute=0, second=0, microsecond=0))
         df_h = df_h.loc[mask].copy()
 
         if df_h.empty:
-            # Sometimes very short rides may not align to an hourly boundary; pick the nearest hour at/after start
             nearest_mask = (pd.to_datetime(times, errors="coerce") >= start_dt.replace(minute=0, second=0, microsecond=0))
             if any(nearest_mask):
                 idx = list(nearest_mask).index(True)
@@ -210,12 +199,9 @@ def build_weather(sh):
             print(f"{PRINT_PREFIX} no hourly overlap found for activity {aid} ({start_dt} to {end_dt}).")
             continue
 
-        # Convert temperature to Fahrenheit for per-hour records
+        # Per-hour conversions
         df_h["temp_f"] = df_h["temp_c"].apply(lambda x: c_to_f(x) if pd.notna(x) else np.nan)
-
-        # Convert wind to MPH for per-hour records
         df_h["windspeed_mph"] = df_h["windspeed_ms"].apply(lambda x: ms_to_mph(x) if pd.notna(x) else np.nan)
-
 
         # Add identifiers
         df_h.insert(0, "activity_id", aid)
@@ -229,7 +215,6 @@ def build_weather(sh):
         # Aggregations for the ride window
         temp_f_avg = float(df_h["temp_f"].mean()) if not df_h["temp_f"].dropna().empty else None
         clouds_avg = float(df_h["cloudcover_pct"].mean()) if not df_h["cloudcover_pct"].dropna().empty else None
-        # wind_s_avg = float(df_h["windspeed_ms"].mean()) if not df_h["windspeed_ms"].dropna().empty else None
         wind_s_avg = float(df_h["windspeed_mph"].mean()) if not df_h["windspeed_mph"].dropna().empty else None
         wind_d_cmn = circular_mean_deg(df_h["winddir_deg"])
 
@@ -248,9 +233,9 @@ def build_weather(sh):
         time.sleep(THROTTLE_S)
 
     df_hourly = pd.concat(hourly_rows, ignore_index=True) if hourly_rows else pd.DataFrame(
-    columns=["activity_id","ride_start_local","ride_end_local","lat","lon",
-             "time_local","temp_c","cloudcover_pct","windspeed_ms","windspeed_mph",
-             "winddir_deg","weathercode","temp_f"]
+        columns=["activity_id","ride_start_local","ride_end_local","lat","lon",
+                 "time_local","temp_c","cloudcover_pct","windspeed_ms","windspeed_mph",
+                 "winddir_deg","weathercode","temp_f"]
     )
 
     df_by_ride = pd.DataFrame(agg_rows, columns=[
@@ -267,11 +252,9 @@ def main():
 
     df_hourly, df_by_ride = build_weather(sh)
 
-    # Write tabs
     write_df_to_tab(sh, TAB_WX_HOURLY, df_hourly)
     write_df_to_tab(sh, TAB_WX_BY_RIDE, df_by_ride)
 
-    # Final debug: list tabs present
     titles = [ws.title for ws in sh.worksheets()]
     print(f"{PRINT_PREFIX} worksheets present: {titles}")
     print(f"{PRINT_PREFIX} DONE")
