@@ -25,9 +25,10 @@ def main():
     temps = hourly.get("temperature_2m", [])[:5]
     clouds = hourly.get("cloudcover", [])[:5]
     wind = hourly.get("windspeed_10m", [])[:5]
+    dirs  = hourly.get("winddirection_10m", [])[:5]
     print("Open-Meteo sample for", date_iso)
-    for t, temp, cc, ws in zip(times, temps, clouds, wind):
-        print(f"{t} | temp {temp}°C | cloud {cc}% | wind {ws} m/s")
+for t, temp, cc, ws, wd in zip(times, temps, clouds, winds, dirs):
+    print(f"{t} | temp {temp}°C | cloud {cc}% | wind {ws} m/s @ {wd}°")
     print("OK: fetched", len(hourly.get("time", [])), "hourly rows.")
 
 if __name__ == "__main__":
