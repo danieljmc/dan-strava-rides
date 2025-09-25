@@ -73,74 +73,65 @@ def fetch_gear_map(access_token):
             m[shoe["id"]] = shoe.get("name") or shoe.get("brand_name") or "Shoes"
     return m
 
-# ---------------- Riders parsing ----------------
+# ---------------- Riders parsing (strict "with" only) ----------------
 WITH_PATTERN = re.compile(r"\bwith\b", flags=re.IGNORECASE)
 
+# minimal stopwords to avoid common non-names even after "with"
 STOPWORDS = {
-    "solo","loop","ride","walk","hike","skate","skating","biking","cycling","trainer","activity",
-    "morning","afternoon","evening","lunch","first","return","reverse","leisurely","slow",
-    "rd","road","street","blvd","park","path","trail","drive","point","beach","lake","falls","notch",
-    "green","bridge","bridges","river","coast","campground","maze","summit",
-    "north","south","east","west",
-    "boys","family","home","dad",
-    "ebbp","nh","ri","fl",
-    "newport","providence","sakonnet","sakonnett","acoaxet","bulgamarsh","horseneck",
-    "padenarem","padanaram","dartmouth","westport","adamsville","sepowet","seapowet","blackstone",
-    "bristol","portsmouth","lincoln","waterville","valley","kancamagus","conway","taunton",
+    "family","boys","dad","mom","wife","husband","kids","scouts","troop",
+    "group","team","party","committee","club",
 }
 
-KEEP_PHRASES = {"the boys"}
+KEEP_PAREN_PHRASES = False  # set True if you want "(the boys)" kept as "the boys"
 
 def strip_parens(t: str) -> str:
     t = t.strip()
     if t.startswith("(") and t.endswith(")"):
-        return t[1:-1].strip()
+        inner = t[1:-1].strip()
+        return inner if KEEP_PAREN_PHRASES else ""
     return t
 
 def is_name_token(tok: str) -> bool:
     if not tok:
         return False
+    if any(ch.isdigit() for ch in tok):
+        return False
     lt = tok.lower()
-    if lt in KEEP_PHRASES: return True
-    if lt in STOPWORDS:    return False
-    if any(ch.isdigit() for ch in tok): return False
-    if tok.endswith("'s") and lt != "o's": return False
-    if len(tok) >= 2 and tok.isupper():   return False
-    return tok[0].isupper()
+    if lt in STOPWORDS:
+        return False
+    # must look like a proper name token (Titlecase single word)
+    return tok[0].isupper() and tok[1:].islower()
 
 def split_by_commas_and_and(s: str) -> list[str]:
     s = s.replace("&", " and ")
     s = re.sub(r"\s+and\s+", ",", s, flags=re.IGNORECASE)
     return [p.strip() for p in s.split(",") if p.strip()]
 
-def tokenize_names(segment: str) -> list[str]:
+def tokenize_names_after_with(segment: str) -> list[str]:
     out = []
     for part in split_by_commas_and_and(segment):
         core = strip_parens(part)
-        if core.lower() in KEEP_PHRASES:
-            out.append(core.title()); continue
         for w in core.split():
             w = w.strip()
             if is_name_token(w):
-                out.append(w.title())
-    # de-dup preserve order
-    seen, unique = set(), []
+                out.append(w)
+    # de-dup, preserve order
+    seen, uniq = set(), []
     for t in out:
         if t not in seen:
-            unique.append(t); seen.add(t)
-    return unique
+            uniq.append(t); seen.add(t)
+    return uniq
 
 def extract_riders_from_name(activity_name: str) -> list[str]:
+    """STRICT: only parse names in the substring after 'with'."""
     if not activity_name:
         return []
     m = WITH_PATTERN.search(activity_name)
-    if m:
-        after = activity_name[m.end():]
-        names = tokenize_names(after)
-        if names:
-            return names
-    # fallback: scan whole title
-    return tokenize_names(activity_name)
+    if not m:
+        return []
+    after = activity_name[m.end():]
+    return tokenize_names_after_with(after)
+
 
 # ---------------- Flatten + enrich ----------------
 def normalize_activities(acts, gear_map):
