@@ -1,4 +1,4 @@
-# pipeline.py  (incremental + weather cache)
+# pipeline.py  (incremental + weather cache) — fixed tz-compare + concat warnings + 'H' deprecation
 import os, json, time, re, math
 from datetime import timedelta
 import requests
@@ -52,7 +52,6 @@ def read_tab_df(sh, title: str) -> pd.DataFrame:
     df = pd.DataFrame(rows[1:], columns=rows[0])
     # try numeric conversion where possible
     for c in df.columns:
-        # leave json-like strings alone
         if df[c].dtype == object:
             try:
                 df[c] = pd.to_numeric(df[c])
@@ -64,7 +63,7 @@ def write_df_to_tab(sh, title: str, df: pd.DataFrame):
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=str(max(len(df)+200, 200)), cols=str(max(26, len(df.columns)+5)))
+        ws = sh.add_worksheet(title=title, rows=str(max((len(df) if df is not None else 0)+200, 200)), cols=str(max(26, (len(df.columns) if df is not None else 1)+5)))
     ws.clear()
     if df is None or df.empty:
         headers = list(df.columns) if df is not None and len(df.columns)>0 else ["_empty"]
@@ -163,7 +162,6 @@ def strip_parens(t: str) -> str:
     return t
 
 def clean_token(w: str) -> str:
-    # Remove leading/trailing non-letters (handles "Becky!" -> "Becky", "Gregg)" -> "Gregg")
     w = w.strip()
     w = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", w)
     return w
@@ -192,7 +190,6 @@ def tokenize_names_after_with(segment: str) -> list[str]:
             if not w: continue
             if is_name_token(w):
                 out.append(w.title())
-    # de-dup preserve order
     seen, uniq = set(), []
     for t in out:
         if t not in seen:
@@ -240,7 +237,6 @@ def circular_mean_deg(deg_list):
     return mean
 
 def wx_condition_from(hour_cc_list, hour_codes):
-    # If any precip codes: Rainy/Snowy; else cloud cover threshold
     rainy_codes = {51,53,55,56,57,61,63,65,66,67,80,81,82}
     snowy_codes = {71,73,75,77,85,86}
     if any(code in snowy_codes for code in hour_codes):
@@ -303,14 +299,32 @@ def merge_incremental(existing: pd.DataFrame, incoming: pd.DataFrame) -> tuple[p
     """
     if existing is None or existing.empty:
         return incoming.copy(), incoming.copy()
-    # Ensure 'id' is numeric
+
     for df in (existing, incoming):
         if "id" in df.columns:
             df["id"] = pd.to_numeric(df["id"], errors="coerce")
+
     existing_ids = set(existing["id"].dropna().astype(int).tolist()) if "id" in existing.columns else set()
+
+    if incoming is None or incoming.empty:
+        # Nothing incoming; no new rows
+        combined = existing.copy()
+        new_rows = incoming.copy() if incoming is not None else pd.DataFrame(columns=existing.columns)
+        return combined, new_rows
+
     incoming["is_new"] = ~incoming["id"].astype("Int64").isin(existing_ids)
     new_rows = incoming[incoming["is_new"]].drop(columns=["is_new"]).copy()
-    combined = pd.concat([existing, new_rows], ignore_index=True, sort=False)
+
+    # Avoid pandas concat empty/all-NA warnings by filtering
+    frames = []
+    if existing is not None and not existing.empty:
+        frames.append(existing)
+    if new_rows is not None and not new_rows.empty:
+        frames.append(new_rows)
+    if frames:
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+    else:
+        combined = incoming.head(0).copy()
     return combined, new_rows
 
 # ---------------- Weather cache load/save ----------------
@@ -321,9 +335,10 @@ def load_weather_cache(sh) -> pd.DataFrame:
             "date", "lat_round", "lon_round",
             "time_iso", "temperature_2m", "cloudcover", "windspeed_10m", "winddirection_10m", "weathercode"
         ])
-    # Normalize types
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    if "time_iso" in df.columns:
+        df["time_iso"] = df["time_iso"].astype(str)
     for col in ["lat_round","lon_round","temperature_2m","cloudcover","windspeed_10m","winddirection_10m","weathercode"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -351,25 +366,34 @@ def append_to_weather_cache(cache_df: pd.DataFrame, lat_r: float, lon_r: float, 
     add_df = pd.DataFrame(rows)
     if add_df.empty:
         return cache_df
-    updated = pd.concat([cache_df, add_df], ignore_index=True)
+    if cache_df is None or cache_df.empty:
+        updated = add_df.copy()
+    else:
+        updated = pd.concat([cache_df, add_df], ignore_index=True)
     return updated
 
 def ensure_hour_in_cache(cache_df: pd.DataFrame, lat_r: float, lon_r: float, date_iso: str) -> pd.DataFrame:
-    # Check if all 24 hours for (date,lat_r,lon_r) exist; if not, fetch & append
     sub = cache_df[(cache_df["lat_round"] == lat_r) & (cache_df["lon_round"] == lon_r) & (cache_df["date"] == pd.to_datetime(date_iso).date())]
     have_hours = len(sub)
     if have_hours >= 24:
         return cache_df
-    # Fetch missing date/location
     data = om_fetch_hourly(lat_r, lon_r, date_iso)
     hourly = data.get("hourly", {})
     cache_df = append_to_weather_cache(cache_df, lat_r, lon_r, date_iso, hourly)
-    time.sleep(0.2)  # be polite
+    time.sleep(0.2)
     return cache_df
+
+# ---- Datetime normalization helper (prevents tz-aware vs tz-naive crash) ----
+def _to_naive_datetime_series(s: pd.Series) -> pd.Series:
+    """
+    Parse timestamps (tz-aware or naive) -> UTC -> strip tz, returning tz-naive.
+    This makes them comparable to tz-naive start/end from start_date_local.
+    """
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+    return dt.dt.tz_convert(None)
 
 # ---------------- Weather enrichment per activity ----------------
 def parse_start_latlon(row):
-    # Prefer real list from API; fallback: string "lat,lon"; else secrets
     v = row.get("start_latlng", None)
     if isinstance(v, list) and len(v) == 2:
         return float(v[0]), float(v[1])
@@ -384,10 +408,10 @@ def parse_start_latlon(row):
     return home_lat, home_lon
 
 def compute_wx_for_activity(row, cache_df: pd.DataFrame):
-    # Start/end time in LOCAL; Open-Meteo returns local with timezone=auto
+    # Start/end time in LOCAL (tz-naive from Strava); keep tz-naive consistently.
     start = pd.to_datetime(row.get("start_date_local"), errors="coerce")
     if pd.isna(start):
-        return None  # cannot compute
+        return None
     secs = pd.to_numeric(row.get("elapsed_time"), errors="coerce")
     if pd.isna(secs):
         return None
@@ -413,8 +437,14 @@ def compute_wx_for_activity(row, cache_df: pd.DataFrame):
     if subset.empty:
         return None
 
-    subset["t"] = pd.to_datetime(subset["time_iso"], errors="coerce")
-    in_window = subset[(subset["t"] >= start.floor("H")) & (subset["t"] <= end.ceil("H"))]
+    # Normalize cache times to tz-naive to match start/end; also handle strings with offsets
+    subset["t"] = _to_naive_datetime_series(subset["time_iso"])
+
+    # Use lowercase 'h' (pandas deprecation fix)
+    in_window = subset[
+        (subset["t"] >= start.floor("h")) &
+        (subset["t"] <= end.ceil("h"))
+    ]
 
     if in_window.empty:
         return None
@@ -425,7 +455,7 @@ def compute_wx_for_activity(row, cache_df: pd.DataFrame):
     wd_deg  = pd.to_numeric(in_window["winddirection_10m"], errors="coerce").dropna().tolist()
     codes   = pd.to_numeric(in_window["weathercode"], errors="coerce").dropna().astype(int).tolist()
 
-    if not temps_c:  # require at least temp to claim "have weather"
+    if not temps_c:
         return None
 
     temp_c_avg = float(np.mean(temps_c))
