@@ -1,6 +1,6 @@
 # weather_etl.py — pull hourly weather for each ride window and write to Google Sheets
 import os, json, math, time, re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Tuple, Optional
 
 import requests
@@ -11,8 +11,10 @@ from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
 
 PRINT_PREFIX = "[WX]"
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OM_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OM_ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 THROTTLE_S = 0.2  # be kind to OM
+REQ_TIMEOUT_S = 90
 
 TAB_ACTIVITIES = "activities_all"
 TAB_WX_HOURLY  = "weather_hourly"
@@ -90,28 +92,51 @@ def parse_latlon(start_latlng_val) -> Optional[Tuple[float, float]]:
     except Exception:
         return None
 
-def fetch_open_meteo_hourly(lat: float, lon: float, start_date_iso: str, end_date_iso: str) -> dict:
+# ---------------- OM helpers ----------------
+def is_past_range(start_iso: str, end_iso: str) -> bool:
+    """Return True if the entire range is <= yesterday; else False."""
+    today = date.today()
+    start_d = pd.to_datetime(start_iso).date()
+    end_d   = pd.to_datetime(end_iso).date()
+    return end_d <= (today - timedelta(days=1))
+
+def om_base_url_for_range(start_iso: str, end_iso: str) -> str:
+    # Use archive for historical ranges, forecast for today/future
+    return OM_ARCHIVE_URL if is_past_range(start_iso, end_iso) else OM_FORECAST_URL
+
+def om_request(lat: float, lon: float, start_iso: str, end_iso: str, retries: int = 3) -> dict:
+    base_url = om_base_url_for_range(start_iso, end_iso)
     params = {
         "latitude": lat,
         "longitude": lon,
         "hourly": "temperature_2m,cloudcover,windspeed_10m,winddirection_10m,weathercode",
-        "start_date": start_date_iso,
-        "end_date": end_date_iso,
-        "timezone": "auto",  # OM returns tz-aware times + a 'timezone' field
+        "start_date": start_iso,
+        "end_date": end_iso,
+        "timezone": "auto",
     }
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=60)
-    if r.status_code == 429:
-        print(f"{PRINT_PREFIX} rate limited; sleeping 60s…")
-        time.sleep(60)
-        r = requests.get(OPEN_METEO_URL, params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    backoff = 2.0
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(base_url, params=params, timeout=REQ_TIMEOUT_S)
+            # Retry on rate limit / server errors
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"{r.status_code} from OM", response=r)
+            r.raise_for_status()
+            return r.json()
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
+            if attempt == retries:
+                raise
+            sleep_s = backoff ** attempt
+            print(f"{PRINT_PREFIX} OM retry {attempt}/{retries} after error {e}; sleeping {sleep_s:.1f}s…")
+            time.sleep(sleep_s)
+    # Should not reach here
+    raise RuntimeError("Open-Meteo request failed after retries")
 
 # ---------------- Time helpers ----------------
 _TZ_RE = re.compile(r"([A-Za-z]+/[A-Za-z_]+)$")
 
 def extract_tz_name(tz_field: Optional[str]) -> Optional[str]:
-    """Extract IANA time zone from strings like '(GMT-05:00) America/New_York' -> 'America/New_York'."""
+    """'(GMT-05:00) America/New_York' -> 'America/New_York'."""
     if not tz_field or not isinstance(tz_field, str):
         return None
     m = _TZ_RE.search(tz_field.strip())
@@ -119,36 +144,27 @@ def extract_tz_name(tz_field: Optional[str]) -> Optional[str]:
 
 def to_local_naive_from_sheet_value(ts_val, tz_field: Optional[str]) -> Optional[datetime]:
     """
-    Convert a sheet value in 'start_date_local' to a TRUE local, tz-naive datetime using the sheet's timezone.
-    - If ts_val contains 'Z' or an offset -> treat as UTC, convert to tz_field, drop tz.
-    - Else -> parse as naive and assume it's already local wall clock.
+    Convert 'start_date_local' to true local tz-naive using sheet timezone:
+      - If value has 'Z' or offset -> treat as UTC, convert to tz_field, drop tz
+      - Else -> parse as naive local
     """
     tzname = extract_tz_name(tz_field)
     if ts_val is None or (isinstance(ts_val, float) and np.isnan(ts_val)):
         return None
     s = str(ts_val)
-    # If looks like ISO with Z/offset, treat as UTC-aware then convert
     if "Z" in s or "+" in s or s.endswith("Z"):
         ts = pd.to_datetime(s, errors="coerce", utc=True)
         if pd.isna(ts):
             return None
-        if tzname:
-            ts_local = ts.tz_convert(tzname)
-        else:
-            ts_local = ts  # leave in UTC if no tz
+        ts_local = ts.tz_convert(tzname) if tzname else ts
         return ts_local.tz_localize(None).to_pydatetime()
-    # otherwise, parse as naive
     ts = pd.to_datetime(s, errors="coerce")
     if pd.isna(ts):
         return None
     return ts.to_pydatetime()
 
 def to_utc_naive(ts: datetime, tzname: Optional[str]) -> datetime:
-    """
-    Convert any datetime to UTC-naive for comparisons.
-    - If tz-aware: tz_convert('UTC') -> drop tz
-    - If naive : tz_localize(tzname or 'UTC') -> tz_convert('UTC') -> drop tz
-    """
+    """Return UTC-naive for stable comparisons."""
     ts_pd = pd.Timestamp(ts)
     if ts_pd.tz is not None:
         return ts_pd.tz_convert("UTC").tz_localize(None).to_pydatetime()
@@ -180,7 +196,7 @@ def build_weather(sh):
     df["elapsed_time_s"] = pd.to_numeric(df["elapsed_time"], errors="coerce")
     df["tz_name"] = df["timezone"].apply(extract_tz_name)
 
-    # TRUE local tz-naive start from the sheet values (which look UTC with Z)
+    # True local tz-naive start from sheet values (sheet stores ISO with Z)
     df["start_dt_local"] = [
         to_local_naive_from_sheet_value(ts_val, tz_field)
         for ts_val, tz_field in zip(df["start_date_local"], df["timezone"])
@@ -212,19 +228,19 @@ def build_weather(sh):
         end_dt_local: datetime = start_dt_local + timedelta(seconds=float(row["elapsed_time_s"]))
         lat, lon = float(row["lat"]), float(row["lon"])
 
-        # Query OM across the involved DATES (local wall clock range)
+        # OM query by local DATE span
         start_day = start_dt_local.date()
         end_day   = end_dt_local.date()
         om_start = start_day.isoformat()
         om_end   = end_day.isoformat()
 
         try:
-            data = fetch_open_meteo_hourly(lat, lon, om_start, om_end)
+            data = om_request(lat, lon, om_start, om_end)  # auto picks archive vs forecast
         except Exception as e:
             print(f"{PRINT_PREFIX} OM error for activity {aid}: {e}")
             continue
 
-        # OM timezone (e.g., "America/New_York"); fallback to sheet tz if missing
+        # OM timezone, fallback to sheet tz if absent
         om_tz = data.get("timezone") or tzname
 
         hourly = data.get("hourly", {})
@@ -235,14 +251,13 @@ def build_weather(sh):
         wind_d = hourly.get("winddirection_10m", [])
         codes  = hourly.get("weathercode", [])
 
-        # Parse OM times as tz-aware → UTC → tz-naive (Series so .tz_* works)
+        # Parse OM times to UTC-naive for comparisons
         times_utc_naive = pd.Series(pd.to_datetime(times, utc=True).tz_convert("UTC").tz_localize(None))
 
-        # Convert ride window to UTC-naive using the sheet/OM tz
+        # Convert ride window to UTC-naive using sheet/OM tz
         start_utc_naive = to_utc_naive(start_dt_local, tzname or om_tz)
         end_utc_naive   = to_utc_naive(end_dt_local,   tzname or om_tz)
 
-        # Build per-hour DataFrame in UTC-naive for comparisons
         df_h = pd.DataFrame({
             "time_utc": times_utc_naive,
             "temp_c": pd.to_numeric(temp_c, errors="coerce"),
@@ -252,14 +267,14 @@ def build_weather(sh):
             "weathercode": pd.to_numeric(codes, errors="coerce")
         }).dropna(subset=["time_utc"])
 
-        # Restrict to hours intersecting the ride [start, end] (floored to hour)
+        # Intersect with floored hourly window
         start_floor_utc = pd.Timestamp(start_utc_naive).replace(minute=0, second=0, microsecond=0).to_pydatetime()
         end_floor_utc   = pd.Timestamp(end_utc_naive).replace(minute=0, second=0, microsecond=0).to_pydatetime()
         mask = (df_h["time_utc"] >= start_floor_utc) & (df_h["time_utc"] <= end_floor_utc)
         df_h = df_h.loc[mask].copy()
 
         if df_h.empty:
-            # If nothing intersects (very short rides), take the first hour at/after start
+            # If nothing intersects (short rides), take the first hour at/after start
             nearest_mask = (times_utc_naive >= start_floor_utc)
             if nearest_mask.any():
                 idx = int(np.argmax(nearest_mask.values))
@@ -280,13 +295,12 @@ def build_weather(sh):
         df_h["temp_f"] = df_h["temp_c"].apply(lambda x: c_to_f(x) if pd.notna(x) else np.nan)
         df_h["windspeed_mph"] = df_h["windspeed_ms"].apply(lambda x: ms_to_mph(x) if pd.notna(x) else np.nan)
 
-        # Add identifiers (also keep original local start/end for reference)
+        # Add identifiers (keep local window for reference)
         df_h.insert(0, "activity_id", aid)
         df_h.insert(1, "ride_start_local", start_dt_local)
         df_h.insert(2, "ride_end_local", end_dt_local)
         df_h.insert(3, "lat", lat)
         df_h.insert(4, "lon", lon)
-        # time_utc already present
 
         hourly_rows.append(df_h)
 
