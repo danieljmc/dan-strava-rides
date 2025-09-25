@@ -1,4 +1,7 @@
-# pipeline.py  (incremental + weather cache) — fixed tz-compare + concat warnings + 'H' deprecation
+# pipeline.py  (incremental + weather cache)
+# hardened datetime handling: tz normalization for both sides, drop bad rows before compare,
+# and extra guards around concat & empty frames; uses 'h' (not 'H').
+
 import os, json, time, re, math
 from datetime import timedelta
 import requests
@@ -9,7 +12,7 @@ from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
 
 print("=== PIPELINE START ===")
-print("PIPELINE VERSION: inc+wx v1")
+print("PIPELINE VERSION: inc+wx v1.1")
 
 # ---------------- Config ----------------
 PER_PAGE = 200  # Strava's max
@@ -50,9 +53,9 @@ def read_tab_df(sh, title: str) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows[1:], columns=rows[0])
-    # try numeric conversion where possible
+    # try numeric conversion where possible (keep strings that look like times intact)
     for c in df.columns:
-        if df[c].dtype == object:
+        if df[c].dtype == object and c not in {"time_iso"}:
             try:
                 df[c] = pd.to_numeric(df[c])
             except Exception:
@@ -63,7 +66,9 @@ def write_df_to_tab(sh, title: str, df: pd.DataFrame):
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=str(max((len(df) if df is not None else 0)+200, 200)), cols=str(max(26, (len(df.columns) if df is not None else 1)+5)))
+        rows_n = (len(df) if df is not None else 0) + 200
+        cols_n = (len(df.columns) if (df is not None and hasattr(df, "columns")) else 1) + 5
+        ws = sh.add_worksheet(title=title, rows=str(max(rows_n, 200)), cols=str(max(26, cols_n)))
     ws.clear()
     if df is None or df.empty:
         headers = list(df.columns) if df is not None and len(df.columns)>0 else ["_empty"]
@@ -307,7 +312,6 @@ def merge_incremental(existing: pd.DataFrame, incoming: pd.DataFrame) -> tuple[p
     existing_ids = set(existing["id"].dropna().astype(int).tolist()) if "id" in existing.columns else set()
 
     if incoming is None or incoming.empty:
-        # Nothing incoming; no new rows
         combined = existing.copy()
         new_rows = incoming.copy() if incoming is not None else pd.DataFrame(columns=existing.columns)
         return combined, new_rows
@@ -315,7 +319,6 @@ def merge_incremental(existing: pd.DataFrame, incoming: pd.DataFrame) -> tuple[p
     incoming["is_new"] = ~incoming["id"].astype("Int64").isin(existing_ids)
     new_rows = incoming[incoming["is_new"]].drop(columns=["is_new"]).copy()
 
-    # Avoid pandas concat empty/all-NA warnings by filtering
     frames = []
     if existing is not None and not existing.empty:
         frames.append(existing)
@@ -339,6 +342,8 @@ def load_weather_cache(sh) -> pd.DataFrame:
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     if "time_iso" in df.columns:
         df["time_iso"] = df["time_iso"].astype(str)
+        # normalize some common weirds (e.g., 'None', '', 'nan')
+        df.loc[~df["time_iso"].str.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", na=False), "time_iso"] = np.nan
     for col in ["lat_round","lon_round","temperature_2m","cloudcover","windspeed_10m","winddirection_10m","weathercode"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -354,7 +359,7 @@ def append_to_weather_cache(cache_df: pd.DataFrame, lat_r: float, lon_r: float, 
     rows = []
     for t, T, C, S, D, W in zip(times, temps, cc, ws, wd, wc):
         rows.append({
-            "date": pd.to_datetime(date_iso).date(),
+            "date": pd.to_datetime(date_iso, errors="coerce").date(),
             "lat_round": lat_r, "lon_round": lon_r,
             "time_iso": t,
             "temperature_2m": T,
@@ -373,24 +378,37 @@ def append_to_weather_cache(cache_df: pd.DataFrame, lat_r: float, lon_r: float, 
     return updated
 
 def ensure_hour_in_cache(cache_df: pd.DataFrame, lat_r: float, lon_r: float, date_iso: str) -> pd.DataFrame:
-    sub = cache_df[(cache_df["lat_round"] == lat_r) & (cache_df["lon_round"] == lon_r) & (cache_df["date"] == pd.to_datetime(date_iso).date())]
-    have_hours = len(sub)
-    if have_hours >= 24:
-        return cache_df
+    date_only = pd.to_datetime(date_iso, errors="coerce").date()
+    if cache_df is not None and not cache_df.empty:
+        sub = cache_df[
+            (cache_df["lat_round"] == lat_r) &
+            (cache_df["lon_round"] == lon_r) &
+            (cache_df["date"] == date_only)
+        ]
+        if len(sub) >= 24:
+            return cache_df
     data = om_fetch_hourly(lat_r, lon_r, date_iso)
     hourly = data.get("hourly", {})
     cache_df = append_to_weather_cache(cache_df, lat_r, lon_r, date_iso, hourly)
     time.sleep(0.2)
     return cache_df
 
-# ---- Datetime normalization helper (prevents tz-aware vs tz-naive crash) ----
+# ---- Datetime normalization helpers ----
 def _to_naive_datetime_series(s: pd.Series) -> pd.Series:
     """
     Parse timestamps (tz-aware or naive) -> UTC -> strip tz, returning tz-naive.
-    This makes them comparable to tz-naive start/end from start_date_local.
+    Drops invalid rows (NaT) later in the caller before comparison.
     """
     dt = pd.to_datetime(s, errors="coerce", utc=True)
+    # dt is tz-aware (UTC). Convert to tz-naive in wall-clock UTC.
     return dt.dt.tz_convert(None)
+
+def _to_naive_ts(ts) -> pd.Timestamp:
+    """Parse single timestamp (string/ts) to tz-naive (via UTC)."""
+    t = pd.to_datetime(ts, errors="coerce", utc=True)
+    if pd.isna(t):
+        return t
+    return t.tz_convert(None)
 
 # ---------------- Weather enrichment per activity ----------------
 def parse_start_latlon(row):
@@ -408,8 +426,8 @@ def parse_start_latlon(row):
     return home_lat, home_lon
 
 def compute_wx_for_activity(row, cache_df: pd.DataFrame):
-    # Start/end time in LOCAL (tz-naive from Strava); keep tz-naive consistently.
-    start = pd.to_datetime(row.get("start_date_local"), errors="coerce")
+    # Start/end time in LOCAL; normalize via UTC->naive for consistent comparison
+    start = _to_naive_ts(row.get("start_date_local"))
     if pd.isna(start):
         return None
     secs = pd.to_numeric(row.get("elapsed_time"), errors="coerce")
@@ -427,6 +445,9 @@ def compute_wx_for_activity(row, cache_df: pd.DataFrame):
     for d in days:
         cache_df = ensure_hour_in_cache(cache_df, lat_r, lon_r, pd.Timestamp(d).date().isoformat())
 
+    if cache_df is None or cache_df.empty:
+        return None
+
     # Pull relevant hours subset across dates within [start, end]
     mask = (
         (cache_df["lat_round"] == lat_r) &
@@ -437,14 +458,24 @@ def compute_wx_for_activity(row, cache_df: pd.DataFrame):
     if subset.empty:
         return None
 
-    # Normalize cache times to tz-naive to match start/end; also handle strings with offsets
+    # Normalize cache times, and drop bad/blank ones before compare
     subset["t"] = _to_naive_datetime_series(subset["time_iso"])
+    subset = subset.dropna(subset=["t"])
+
+    if subset.empty:
+        return None
 
     # Use lowercase 'h' (pandas deprecation fix)
-    in_window = subset[
-        (subset["t"] >= start.floor("h")) &
-        (subset["t"] <= end.ceil("h"))
-    ]
+    left = start.floor("h")
+    right = end.ceil("h")
+    try:
+        in_window = subset[(subset["t"] >= left) & (subset["t"] <= right)]
+    except Exception as e:
+        # As a last resort, compare as numpy datetime64[ns] (fully naive)
+        subset["t64"] = subset["t"].values.astype("datetime64[ns]")
+        left64 = np.datetime64(left.to_pydatetime())
+        right64 = np.datetime64(right.to_pydatetime())
+        in_window = subset[(subset["t64"] >= left64) & (subset["t64"] <= right64)]
 
     if in_window.empty:
         return None
