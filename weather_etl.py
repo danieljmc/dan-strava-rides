@@ -30,7 +30,7 @@ def gspread_client_from_secret():
 
 def read_tab_to_df(sh, title: str) -> pd.DataFrame:
     ws = sh.worksheet(title)
-    # Back-compatible call: older gspread lacks numeric_value_strategy
+    # Back-compatible: older gspread lacks numeric_value_strategy
     try:
         data = ws.get_all_records(numeric_value_strategy="RAW")
     except TypeError:
@@ -97,7 +97,7 @@ def fetch_open_meteo_hourly(lat: float, lon: float, start_date_iso: str, end_dat
         "hourly": "temperature_2m,cloudcover,windspeed_10m,winddirection_10m,weathercode",
         "start_date": start_date_iso,
         "end_date": end_date_iso,
-        "timezone": "auto",  # OM returns tz-aware timestamps
+        "timezone": "auto",  # OM returns times with tz info + returns a 'timezone' field
     }
     r = requests.get(OPEN_METEO_URL, params=params, timeout=60)
     if r.status_code == 429:
@@ -107,14 +107,26 @@ def fetch_open_meteo_hourly(lat: float, lon: float, start_date_iso: str, end_dat
     r.raise_for_status()
     return r.json()
 
-def _strip_tz(series: pd.Series) -> pd.Series:
-    """Ensure a datetime series is tz-naive (strip timezone if present)."""
-    s = pd.to_datetime(series, errors="coerce")
-    try:
-        # Works if s is tz-aware; raises if tz-naive
-        return s.dt.tz_localize(None)
-    except (TypeError, AttributeError):
-        return s
+def to_utc_naive(ts: datetime, tzname: Optional[str]) -> datetime:
+    """
+    Take a tz-naive local datetime and return UTC-naive datetime,
+    by localizing to tzname then converting to UTC and stripping tzinfo.
+    """
+    ts_pd = pd.Timestamp(ts)
+    if tzname:
+        # Handle DST edge cases
+        try:
+            ts_local = ts_pd.tz_localize(tzname, nonexistent="shift_forward", ambiguous="NaT")
+            if pd.isna(ts_local):
+                # Fallback if ambiguous became NaT: assume 'ambiguous=True'
+                ts_local = ts_pd.tz_localize(tzname, nonexistent="shift_forward", ambiguous=True)
+        except Exception:
+            # As a last resort, assume local wall clock is already in UTC offset 0
+            ts_local = ts_pd.tz_localize("UTC")
+    else:
+        ts_local = ts_pd.tz_localize("UTC")
+    ts_utc = ts_local.tz_convert("UTC")
+    return ts_utc.tz_localize(None).to_pydatetime()
 
 # ---------------- Core ETL ----------------
 def build_weather(sh):
@@ -131,7 +143,7 @@ def build_weather(sh):
     df = df_acts.copy()
     df["activity_id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
     df["elapsed_time_s"] = pd.to_numeric(df["elapsed_time"], errors="coerce")
-    # start_date_local from sheet is tz-naive local time
+    # tz-naive local wall clock from your sheet
     df["start_dt_local"] = pd.to_datetime(df["start_date_local"], errors="coerce")
 
     latlons = df["start_latlng"].apply(parse_latlon)
@@ -155,13 +167,13 @@ def build_weather(sh):
 
     for _, row in elig.iterrows():
         aid = int(row["activity_id"])
-        start_dt: datetime = row["start_dt_local"].to_pydatetime()  # tz-naive
-        end_dt: datetime = start_dt + timedelta(seconds=float(row["elapsed_time_s"]))
+        start_dt_local: datetime = row["start_dt_local"].to_pydatetime()  # tz-naive local
+        end_dt_local: datetime = start_dt_local + timedelta(seconds=float(row["elapsed_time_s"]))
         lat, lon = float(row["lat"]), float(row["lon"])
 
-        # Build OM query range (by day)
-        start_day = start_dt.date()
-        end_day   = end_dt.date()
+        # Query OM across the involved dates
+        start_day = start_dt_local.date()
+        end_day   = end_dt_local.date()
         om_start = start_day.isoformat()
         om_end   = end_day.isoformat()
 
@@ -171,6 +183,9 @@ def build_weather(sh):
             print(f"{PRINT_PREFIX} OM error for activity {aid}: {e}")
             continue
 
+        # OM metadata timezone, e.g. "America/New_York"
+        om_tz = data.get("timezone") or "UTC"
+
         hourly = data.get("hourly", {})
         times  = hourly.get("time", [])
         temp_c = hourly.get("temperature_2m", [])
@@ -179,32 +194,36 @@ def build_weather(sh):
         wind_d = hourly.get("winddirection_10m", [])
         codes  = hourly.get("weathercode", [])
 
-        # Key fix: strip timezone so comparisons are tz-naive vs tz-naive
-        times_naive = _strip_tz(pd.Series(times))
+        # Parse OM times as tz-aware (respect +00:00 or zone offset), then convert to UTC and strip tz
+        times_utc_naive = pd.to_datetime(times, utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
 
+        # Convert ride window to UTC-naive
+        start_utc_naive = to_utc_naive(start_dt_local, om_tz)
+        end_utc_naive   = to_utc_naive(end_dt_local,   om_tz)
+
+        # Build per-hour DataFrame in UTC-naive clock for comparisons
         df_h = pd.DataFrame({
-            "time_local": times_naive,
+            "time_utc": times_utc_naive,
             "temp_c": pd.to_numeric(temp_c, errors="coerce"),
             "cloudcover_pct": pd.to_numeric(clouds, errors="coerce"),
             "windspeed_ms": pd.to_numeric(wind_s, errors="coerce"),
             "winddir_deg": pd.to_numeric(wind_d, errors="coerce"),
             "weathercode": pd.to_numeric(codes, errors="coerce")
-        }).dropna(subset=["time_local"])
+        }).dropna(subset=["time_utc"])
 
-        # Keep only hours that intersect [start_dt, end_dt] on hour boundaries (inclusive)
-        start_floor = start_dt.replace(minute=0, second=0, microsecond=0)
-        end_floor   = end_dt.replace(minute=0, second=0, microsecond=0)
-        mask = (df_h["time_local"] >= start_floor) & (df_h["time_local"] <= end_floor)
+        # Restrict to hours intersecting the ride [start, end] (floored to hour)
+        start_floor_utc = pd.Timestamp(start_utc_naive).replace(minute=0, second=0, microsecond=0).to_pydatetime()
+        end_floor_utc   = pd.Timestamp(end_utc_naive).replace(minute=0, second=0, microsecond=0).to_pydatetime()
+        mask = (df_h["time_utc"] >= start_floor_utc) & (df_h["time_utc"] <= end_floor_utc)
         df_h = df_h.loc[mask].copy()
 
         if df_h.empty:
-            # If no overlap (e.g., very short ride), take the first hour at/after start
-            times_all_naive = times_naive
-            nearest_mask = (times_all_naive >= start_floor)
+            # If nothing intersects (very short rides), take the first hour at/after start
+            nearest_mask = (times_utc_naive >= start_floor_utc)
             if nearest_mask.any():
                 idx = list(nearest_mask).index(True)
                 df_h = pd.DataFrame({
-                    "time_local": [times_all_naive.iloc[idx]],
+                    "time_utc": [times_utc_naive.iloc[idx]],
                     "temp_c": [pd.to_numeric(temp_c[idx], errors="coerce")],
                     "cloudcover_pct": [pd.to_numeric(clouds[idx], errors="coerce")],
                     "windspeed_ms": [pd.to_numeric(wind_s[idx], errors="coerce")],
@@ -213,19 +232,21 @@ def build_weather(sh):
                 })
 
         if df_h.empty:
-            print(f"{PRINT_PREFIX} no hourly overlap found for activity {aid} ({start_dt} to {end_dt}).")
+            print(f"{PRINT_PREFIX} no hourly overlap found for activity {aid} ({start_dt_local} to {end_dt_local}).")
             continue
 
         # Per-hour conversions
         df_h["temp_f"] = df_h["temp_c"].apply(lambda x: c_to_f(x) if pd.notna(x) else np.nan)
         df_h["windspeed_mph"] = df_h["windspeed_ms"].apply(lambda x: ms_to_mph(x) if pd.notna(x) else np.nan)
 
-        # Add identifiers
+        # Add identifiers (also keep original local start/end for reference)
         df_h.insert(0, "activity_id", aid)
-        df_h.insert(1, "ride_start_local", start_dt)
-        df_h.insert(2, "ride_end_local", end_dt)
+        df_h.insert(1, "ride_start_local", start_dt_local)
+        df_h.insert(2, "ride_end_local", end_dt_local)
         df_h.insert(3, "lat", lat)
         df_h.insert(4, "lon", lon)
+        # optional: also include the UTC window used
+        df_h.insert(5, "time_utc", df_h.pop("time_utc"))
 
         hourly_rows.append(df_h)
 
@@ -237,8 +258,8 @@ def build_weather(sh):
 
         agg_rows.append({
             "activity_id": aid,
-            "ride_start_local": start_dt,
-            "ride_end_local": end_dt,
+            "ride_start_local": start_dt_local,
+            "ride_end_local": end_dt_local,
             "lat": lat, "lon": lon,
             "avg_temp_f": temp_f_avg,
             "avg_cloudcover_pct": clouds_avg,
@@ -251,7 +272,7 @@ def build_weather(sh):
 
     df_hourly = pd.concat(hourly_rows, ignore_index=True) if hourly_rows else pd.DataFrame(
         columns=["activity_id","ride_start_local","ride_end_local","lat","lon",
-                 "time_local","temp_c","cloudcover_pct","windspeed_ms","windspeed_mph",
+                 "time_utc","temp_c","cloudcover_pct","windspeed_ms","windspeed_mph",
                  "winddir_deg","weathercode","temp_f"]
     )
 
