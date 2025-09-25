@@ -34,7 +34,6 @@ def read_tab_to_df(sh, title: str) -> pd.DataFrame:
     try:
         data = ws.get_all_records(numeric_value_strategy="RAW")
     except TypeError:
-        # Fallback for older gspread — returns best-effort typing
         data = ws.get_all_records()
     return pd.DataFrame(data)
 
@@ -98,7 +97,7 @@ def fetch_open_meteo_hourly(lat: float, lon: float, start_date_iso: str, end_dat
         "hourly": "temperature_2m,cloudcover,windspeed_10m,winddirection_10m,weathercode",
         "start_date": start_date_iso,
         "end_date": end_date_iso,
-        "timezone": "auto",
+        "timezone": "auto",  # OM returns tz-aware timestamps
     }
     r = requests.get(OPEN_METEO_URL, params=params, timeout=60)
     if r.status_code == 429:
@@ -107,6 +106,15 @@ def fetch_open_meteo_hourly(lat: float, lon: float, start_date_iso: str, end_dat
         r = requests.get(OPEN_METEO_URL, params=params, timeout=60)
     r.raise_for_status()
     return r.json()
+
+def _strip_tz(series: pd.Series) -> pd.Series:
+    """Ensure a datetime series is tz-naive (strip timezone if present)."""
+    s = pd.to_datetime(series, errors="coerce")
+    try:
+        # Works if s is tz-aware; raises if tz-naive
+        return s.dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        return s
 
 # ---------------- Core ETL ----------------
 def build_weather(sh):
@@ -123,6 +131,7 @@ def build_weather(sh):
     df = df_acts.copy()
     df["activity_id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
     df["elapsed_time_s"] = pd.to_numeric(df["elapsed_time"], errors="coerce")
+    # start_date_local from sheet is tz-naive local time
     df["start_dt_local"] = pd.to_datetime(df["start_date_local"], errors="coerce")
 
     latlons = df["start_latlng"].apply(parse_latlon)
@@ -146,10 +155,11 @@ def build_weather(sh):
 
     for _, row in elig.iterrows():
         aid = int(row["activity_id"])
-        start_dt: datetime = row["start_dt_local"].to_pydatetime()
+        start_dt: datetime = row["start_dt_local"].to_pydatetime()  # tz-naive
         end_dt: datetime = start_dt + timedelta(seconds=float(row["elapsed_time_s"]))
         lat, lon = float(row["lat"]), float(row["lon"])
 
+        # Build OM query range (by day)
         start_day = start_dt.date()
         end_day   = end_dt.date()
         om_start = start_day.isoformat()
@@ -169,8 +179,11 @@ def build_weather(sh):
         wind_d = hourly.get("winddirection_10m", [])
         codes  = hourly.get("weathercode", [])
 
+        # Key fix: strip timezone so comparisons are tz-naive vs tz-naive
+        times_naive = _strip_tz(pd.Series(times))
+
         df_h = pd.DataFrame({
-            "time_local": pd.to_datetime(times, errors="coerce"),
+            "time_local": times_naive,
             "temp_c": pd.to_numeric(temp_c, errors="coerce"),
             "cloudcover_pct": pd.to_numeric(clouds, errors="coerce"),
             "windspeed_ms": pd.to_numeric(wind_s, errors="coerce"),
@@ -178,16 +191,20 @@ def build_weather(sh):
             "weathercode": pd.to_numeric(codes, errors="coerce")
         }).dropna(subset=["time_local"])
 
-        mask = (df_h["time_local"] >= start_dt.replace(minute=0, second=0, microsecond=0)) & \
-               (df_h["time_local"] <= end_dt.replace(minute=0, second=0, microsecond=0))
+        # Keep only hours that intersect [start_dt, end_dt] on hour boundaries (inclusive)
+        start_floor = start_dt.replace(minute=0, second=0, microsecond=0)
+        end_floor   = end_dt.replace(minute=0, second=0, microsecond=0)
+        mask = (df_h["time_local"] >= start_floor) & (df_h["time_local"] <= end_floor)
         df_h = df_h.loc[mask].copy()
 
         if df_h.empty:
-            nearest_mask = (pd.to_datetime(times, errors="coerce") >= start_dt.replace(minute=0, second=0, microsecond=0))
-            if any(nearest_mask):
+            # If no overlap (e.g., very short ride), take the first hour at/after start
+            times_all_naive = times_naive
+            nearest_mask = (times_all_naive >= start_floor)
+            if nearest_mask.any():
                 idx = list(nearest_mask).index(True)
                 df_h = pd.DataFrame({
-                    "time_local": [pd.to_datetime(times[idx])],
+                    "time_local": [times_all_naive.iloc[idx]],
                     "temp_c": [pd.to_numeric(temp_c[idx], errors="coerce")],
                     "cloudcover_pct": [pd.to_numeric(clouds[idx], errors="coerce")],
                     "windspeed_ms": [pd.to_numeric(wind_s[idx], errors="coerce")],
@@ -252,9 +269,11 @@ def main():
 
     df_hourly, df_by_ride = build_weather(sh)
 
+    # Write tabs
     write_df_to_tab(sh, TAB_WX_HOURLY, df_hourly)
     write_df_to_tab(sh, TAB_WX_BY_RIDE, df_by_ride)
 
+    # Final debug: list tabs present
     titles = [ws.title for ws in sh.worksheets()]
     print(f"{PRINT_PREFIX} worksheets present: {titles}")
     print(f"{PRINT_PREFIX} DONE")
