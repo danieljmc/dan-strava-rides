@@ -1,4 +1,4 @@
-# pipeline.py  (riders v3)
+# pipeline.py  (riders v5)
 import os, json, time, re
 import requests
 import pandas as pd
@@ -6,14 +6,17 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
 
-print("PIPELINE VERSION: riders v3")
+print("=== PIPELINE START ===")
+print("PIPELINE VERSION: riders v5")
 
 # ---------------- Config ----------------
+# NOTE: Strava caps per_page at 200 for /athlete/activities
 PER_PAGE = 200
 TAB_ACTIVITIES = "activities_all"   # wide table: all summary fields + parsed riders
 TAB_RIDERS_LONG = "riders_long"     # long table: (activity_id, rider_name)
 THROTTLE_S = 0.2
 ADD_GEAR_NAME = True
+INCLUDE_SOLO_PLACEHOLDER = True     # add " Solo" rows for activities with no riders
 
 # ---------------- Strava auth ----------------
 def get_strava_access_token():
@@ -70,16 +73,30 @@ def fetch_gear_map(access_token):
             m[bike["id"]] = bike.get("name") or bike.get("brand_name") or "Bike"
     for shoe in (data.get("shoes") or []):
         if shoe.get("id"):
-            m[shoe["id"]] = shoe.get("name") or shoe.get("brand_name") or "Shoes"
+            m[shoe["id"]] = bike.get("name") if False else shoe.get("name") or shoe.get("brand_name") or "Shoes"
     return m
 
 # ---------------- Riders parsing (strict "with" only) ----------------
 WITH_PATTERN = re.compile(r"\bwith\b", flags=re.IGNORECASE)
 
-# minimal stopwords to avoid common non-names even after "with"
+# Stopwords (lowercase) — extended per your list
 STOPWORDS = {
-    "family","boys","dad","mom","wife","husband","kids","scouts","troop",
-    "group","team","party","committee","club",
+    # people-ish groups / family
+    "family","boys","dad","mom","wife","husband","kids","scouts","troop","group","team","party","committee","club",
+    # misc generic
+    "home",
+    # local places / common words
+    "washington","tiverton","fall","river","sepowet","boy","scout","hill","buck","secondary",
+    # already had many of these in earlier versions
+    "solo","loop","ride","walk","hike","skate","skating","biking","cycling","trainer","activity",
+    "morning","afternoon","evening","lunch","first","return","reverse","leisurely","slow",
+    "rd","road","street","blvd","park","path","trail","drive","point","beach","lake","falls","notch",
+    "green","bridge","bridges","river","coast","campground","maze","summit",
+    "north","south","east","west",
+    "ebbp","nh","ri","fl",
+    "newport","providence","sakonnet","sakonnett","acoaxet","bulgamarsh","horseneck",
+    "padenarem","padanaram","dartmouth","westport","adamsville","seapowet","blackstone",
+    "bristol","portsmouth","lincoln","waterville","valley","kancamagus","conway","taunton",
 }
 
 KEEP_PAREN_PHRASES = False  # set True if you want "(the boys)" kept as "the boys"
@@ -90,6 +107,12 @@ def strip_parens(t: str) -> str:
         inner = t[1:-1].strip()
         return inner if KEEP_PAREN_PHRASES else ""
     return t
+
+def clean_token(w: str) -> str:
+    # Remove leading/trailing non-letters (handles "Becky!" -> "Becky", "Gregg)" -> "Gregg")
+    w = w.strip()
+    w = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", w)
+    return w
 
 def is_name_token(tok: str) -> bool:
     if not tok:
@@ -112,9 +135,11 @@ def tokenize_names_after_with(segment: str) -> list[str]:
     for part in split_by_commas_and_and(segment):
         core = strip_parens(part)
         for w in core.split():
-            w = w.strip()
+            w = clean_token(w)
+            if not w:
+                continue
             if is_name_token(w):
-                out.append(w)
+                out.append(w.title())
     # de-dup, preserve order
     seen, uniq = set(), []
     for t in out:
@@ -131,7 +156,6 @@ def extract_riders_from_name(activity_name: str) -> list[str]:
         return []
     after = activity_name[m.end():]
     return tokenize_names_after_with(after)
-
 
 # ---------------- Flatten + enrich ----------------
 def normalize_activities(acts, gear_map):
@@ -174,14 +198,23 @@ def build_riders_long(df_activities: pd.DataFrame) -> pd.DataFrame:
     if "id" not in df_activities.columns or "other_riders" not in df_activities.columns:
         print("riders_long: missing 'id' or 'other_riders'; returning empty.")
         return pd.DataFrame(columns=cols)
+
     rows = []
+    # Rows for activities that DO have riders
     for act_id, riders in zip(df_activities["id"], df_activities["other_riders"]):
-        if not riders:
-            continue
-        for rider in [r.strip() for r in riders.split(",") if r.strip()]:
-            rows.append({"activity_id": int(act_id), "rider_name": rider})
+        if riders:
+            for rider in [r.strip() for r in riders.split(",") if r.strip()]:
+                rows.append({"activity_id": int(act_id), "rider_name": rider})
+
+    # Optional: add a synthetic " Solo" row for truly solo rides
+    if INCLUDE_SOLO_PLACEHOLDER:
+        solo_mask = (df_activities["other_riders_count"].fillna(0) == 0) | (df_activities["other_riders"].fillna("") == "")
+        solo_ids = df_activities.loc[solo_mask, "id"]
+        for act_id in solo_ids:
+            rows.append({"activity_id": int(act_id), "rider_name": " Solo"})
+
     df = pd.DataFrame(rows, columns=cols)
-    print(f"riders_long rows: {len(df)}")
+    print(f"riders_long rows: {len(df)} (includes ' Solo' placeholders: {INCLUDE_SOLO_PLACEHOLDER})")
     return df
 
 # ---------------- Google Sheets I/O ----------------
@@ -213,11 +246,9 @@ def write_df_to_tab(sh, title: str, df: pd.DataFrame):
 def write_dataframes_to_sheet(df_acts: pd.DataFrame, df_riders: pd.DataFrame):
     gc = gspread_client_from_secret()
     sh = gc.open_by_key(os.environ["SHEET_ID"])
-
-    # Write riders FIRST so you can see its log line even if activities succeeds
+    # Write riders first so logs are easy to see
     write_df_to_tab(sh, TAB_RIDERS_LONG, df_riders)
     write_df_to_tab(sh, TAB_ACTIVITIES, df_acts)
-
     # Final debug: list tabs present
     titles = [ws.title for ws in sh.worksheets()]
     print("Worksheets now present:", titles)
