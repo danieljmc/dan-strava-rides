@@ -1,0 +1,29 @@
+name: Weather ETL
+
+on:
+  workflow_dispatch: {}   # run manually from Actions tab
+
+jobs:
+  run-weather-etl:
+    runs-on: ubuntu-latest
+
+    env:
+      GCP_SVC_JSON: ${{ secrets.GCP_SVC_JSON }}
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy gspread gspread_dataframe google-auth requests
+
+      - name: Run Weather ETL
+        run: |
+          python weather_etl.py
