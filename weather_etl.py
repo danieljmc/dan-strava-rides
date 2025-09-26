@@ -29,8 +29,8 @@ WX_FORCE_REBUILD = os.getenv("WX_FORCE_REBUILD", "0") in ("1","true","True","YES
 # Treat summary rows without hours as "missing"?
 WX_ZERO_HOURS_IS_MISSING = os.getenv("WX_ZERO_HOURS_IS_MISSING", "1") in ("1","true","True","YES","yes")
 
-# Secret fallback location (env)
-def _env_float(name: str) -> Optional[float]:
+# Secret fallback location (env) — accept SECRET_* or HOME_* for compatibility
+def _env_float(name: str):
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
         return None
@@ -39,11 +39,22 @@ def _env_float(name: str) -> Optional[float]:
     except Exception:
         return None
 
-SECRET_LAT = _env_float("SECRET_LAT")
-SECRET_LON = _env_float("SECRET_LON")
-SECRET_LATLON: Optional[Tuple[float, float]] = (SECRET_LAT, SECRET_LON) if (SECRET_LAT is not None and SECRET_LON is not None) else None
-if SECRET_LATLON is None:
-    print(f"{PRINT_PREFIX} WARNING: SECRET_LAT/SECRET_LON not set; missing start_latlng will remain missing.")
+def _env_float_any(names):
+    for n in names:
+        val = _env_float(n)
+        if val is not None:
+            return val, n
+    return None, None
+
+SECRET_LAT, lat_key = _env_float_any(["SECRET_LAT", "HOME_LAT"])
+SECRET_LON, lon_key = _env_float_any(["SECRET_LON", "HOME_LON"])
+SECRET_LATLON = (SECRET_LAT, SECRET_LON) if (SECRET_LAT is not None and SECRET_LON is not None) else None
+
+if SECRET_LATLON:
+    print(f"{PRINT_PREFIX} Using SECRET fallback lat/lon from {lat_key}/{lon_key}.")
+else:
+    print(f"{PRINT_PREFIX} WARNING: no fallback lat/lon found (checked SECRET_* and HOME_*). Missing coords will be skipped.")
+
 
 # ---------------- Google Sheets helpers ----------------
 def gspread_client_from_secret():
