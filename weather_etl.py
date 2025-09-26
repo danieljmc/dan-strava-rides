@@ -26,6 +26,22 @@ WX_MAX_RIDES     = int(os.getenv("WX_MAX_RIDES", "0"))   # 0 = no cap
 WX_FLUSH_EVERY   = int(os.getenv("WX_FLUSH_EVERY", "25"))
 WX_FORCE_REBUILD = os.getenv("WX_FORCE_REBUILD", "0") in ("1","true","True","YES","yes")
 
+# Secret fallback location (env)
+def _env_float(name: str) -> Optional[float]:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+SECRET_LAT = _env_float("SECRET_LAT")
+SECRET_LON = _env_float("SECRET_LON")
+SECRET_LATLON: Optional[Tuple[float, float]] = (SECRET_LAT, SECRET_LON) if (SECRET_LAT is not None and SECRET_LON is not None) else None
+if SECRET_LATLON is None:
+    print(f"{PRINT_PREFIX} WARNING: SECRET_LAT/SECRET_LON not set; missing start_latlng will remain missing.")
+
 # ---------------- Google Sheets helpers ----------------
 def gspread_client_from_secret():
     svc_info = json.loads(os.environ["GCP_SVC_JSON"])
@@ -80,19 +96,61 @@ def circular_mean_deg(deg_series: pd.Series) -> Optional[float]:
         mean_deg += 360.0
     return float(mean_deg)
 
-def parse_latlon(start_latlng_val) -> Optional[Tuple[float, float]]:
-    if start_latlng_val in (None, "", "[]", "null"):
-        return None
+# ---- Robust lat/lon parsing with fallback to secret
+def _is_valid_latlon(lat: float, lon: float) -> bool:
     try:
-        arr = start_latlng_val if isinstance(start_latlng_val, list) else json.loads(start_latlng_val)
-        if not isinstance(arr, (list, tuple)) or len(arr) < 2:
-            return None
-        lat = float(arr[0]); lon = float(arr[1])
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            return None
-        return lat, lon
+        lat = float(lat); lon = float(lon)
     except Exception:
-        return None
+        return False
+    if any([(lat != lat), (lon != lon)]):  # NaN check without math.isnan for robustness
+        return False
+    return (-90.0 <= lat <= 90.0) and (-180.0 <= lon <= 180.0)
+
+def parse_latlon(start_latlng_val, fallback: Optional[Tuple[float, float]] = None) -> Optional[Tuple[float, float]]:
+    """
+    Robustly parse a [lat, lon] from list/tuple/str. Returns `fallback` when missing/invalid.
+    Accepts:
+      - [41.687101, -71.284574]
+      - "[41.687101, -71.284574]"
+      - "[]", "", None, "null", "NaN" -> fallback
+    """
+    # list/tuple fast path
+    if isinstance(start_latlng_val, (list, tuple)):
+        if len(start_latlng_val) >= 2:
+            try:
+                lat = float(start_latlng_val[0]); lon = float(start_latlng_val[1])
+                return (lat, lon) if _is_valid_latlon(lat, lon) else fallback
+            except Exception:
+                return fallback
+        return fallback
+
+    if start_latlng_val is None:
+        return fallback
+
+    if isinstance(start_latlng_val, str):
+        s = start_latlng_val.strip()
+        if s in ("", "[]", "null", "None", "NaN", "nan"):
+            return fallback
+
+        # Quick manual parse
+        core = s.strip("[]() ")
+        parts = [p.strip() for p in core.split(",") if p.strip() != ""]
+        if len(parts) >= 2:
+            try:
+                lat = float(parts[0]); lon = float(parts[1])
+                if _is_valid_latlon(lat, lon):
+                    return (lat, lon)
+            except Exception:
+                pass
+
+        # JSON attempt
+        try:
+            arr = json.loads(s)
+            return parse_latlon(arr, fallback=fallback)
+        except Exception:
+            return fallback
+
+    return fallback
 
 # ---------------- Open-Meteo helpers ----------------
 def is_past_range(start_iso: str, end_iso: str) -> bool:
@@ -200,7 +258,9 @@ def build_weather(sh):
         to_local_naive_from_sheet_value(ts_val, tz_field)
         for ts_val, tz_field in zip(df["start_date_local"], df["timezone"])
     ]
-    latlons = df["start_latlng"].apply(parse_latlon)
+
+    # Use real lat/lon if present; otherwise fall back to SECRET_LATLON (if configured)
+    latlons = df["start_latlng"].apply(lambda v: parse_latlon(v, fallback=SECRET_LATLON))
     df["lat"] = latlons.apply(lambda t: t[0] if t else np.nan)
     df["lon"] = latlons.apply(lambda t: t[1] if t else np.nan)
 
@@ -231,7 +291,7 @@ def build_weather(sh):
     total = len(elig)
     if total == 0:
         print(f"{PRINT_PREFIX} no new activities to process in scope.")
-        # *** CRITICAL CHANGE: return existing data as-is; DO NOT clear tabs here ***
+        # return existing data as-is; DO NOT clear tabs here
         return df_hourly_existing, df_by_ride_existing
 
     # Accumulators (new rows only)
@@ -370,6 +430,10 @@ def main():
     if WX_MAX_RIDES: print(f"{PRINT_PREFIX} WX_MAX_RIDES={WX_MAX_RIDES}")
     print(f"{PRINT_PREFIX} WX_FLUSH_EVERY={WX_FLUSH_EVERY}")
     if WX_FORCE_REBUILD: print(f"{PRINT_PREFIX} WX_FORCE_REBUILD=1 (ignoring existing)")
+    if SECRET_LATLON:
+        print(f"{PRINT_PREFIX} Using SECRET fallback lat/lon when missing.")
+    else:
+        print(f"{PRINT_PREFIX} No SECRET fallback; missing coords will be skipped.")
 
     gc = gspread_client_from_secret()
     sh = gc.open_by_key(os.environ["SHEET_ID"])
