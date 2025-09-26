@@ -11,10 +11,6 @@ on:
         description: "Cap number of rides to process (0 = no cap)."
         required: false
         default: "0"
-      flush_every:
-        description: "Flush partial results to Sheets every N rides."
-        required: false
-        default: "25"
       places:
         description: "Rounding places for cache key (3≈120m, 2≈1.1km)."
         required: false
@@ -24,9 +20,13 @@ on:
         required: false
         default: "opencage"
       throttle_s:
-        description: "Seconds to sleep between lookups (use 1.0 for Nominatim)."
+        description: "Seconds to sleep per lookup (use 1.0 for Nominatim)."
         required: false
         default: "0.25"
+      checkpoint_minutes:
+        description: "Optional: write results every N minutes (0 = only at end)."
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -38,7 +38,7 @@ concurrency:
 jobs:
   run-geocode-etl:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -79,12 +79,12 @@ jobs:
           HOME_LAT:     ${{ secrets.HOME_LAT }}
           HOME_LON:     ${{ secrets.HOME_LON }}
           # Inputs → env
-          RG_SINCE:       ${{ inputs.since }}
-          RG_MAX_RIDES:   ${{ inputs.max_rides }}
-          RG_FLUSH_EVERY: ${{ inputs.flush_every }}
-          RG_PLACES:      ${{ inputs.places }}
-          RG_PROVIDER:    ${{ inputs.provider }}
-          RG_THROTTLE_S:  ${{ inputs.throttle_s }}
+          RG_SINCE:          ${{ inputs.since }}
+          RG_MAX_RIDES:      ${{ inputs.max_rides }}
+          RG_PLACES:         ${{ inputs.places }}
+          RG_PROVIDER:       ${{ inputs.provider }}
+          RG_THROTTLE_S:     ${{ inputs.throttle_s }}
+          RG_CHECKPOINT_MIN: ${{ inputs.checkpoint_minutes }}
         run: |
           echo "[RG] Starting Geocode ETL…"
           python geocode_etl.py
