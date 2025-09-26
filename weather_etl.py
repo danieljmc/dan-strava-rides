@@ -39,11 +39,11 @@ def _env_float(name: str) -> Optional[float]:
     except Exception:
         return None
 
-HOME_LAT = _env_float("HOME_LAT")
-HOME_LON = _env_float("HOME_LON")
-HOME_LATLON: Optional[Tuple[float, float]] = (HOME_LAT, HOME_LON) if (HOME_LAT is not None and HOME_LON is not None) else None
-if HOME_LATLON is None:
-    print(f"{PRINT_PREFIX} WARNING: HOME_LAT/HOME_LON not set; missing start_latlng will remain missing.")
+SECRET_LAT = _env_float("SECRET_LAT")
+SECRET_LON = _env_float("SECRET_LON")
+SECRET_LATLON: Optional[Tuple[float, float]] = (SECRET_LAT, SECRET_LON) if (SECRET_LAT is not None and SECRET_LON is not None) else None
+if SECRET_LATLON is None:
+    print(f"{PRINT_PREFIX} WARNING: SECRET_LAT/SECRET_LON not set; missing start_latlng will remain missing.")
 
 # ---------------- Google Sheets helpers ----------------
 def gspread_client_from_secret():
@@ -262,8 +262,8 @@ def build_weather(sh):
         to_local_naive_from_sheet_value(ts_val, tz_field)
         for ts_val, tz_field in zip(df["start_date_local"], df["timezone"])
     ]
-    # Use real lat/lon if present; otherwise fall back to HOME_LATLON (if configured)
-    latlons = df["start_latlng"].apply(lambda v: parse_latlon(v, fallback=HOME_LATLON))
+    # Use real lat/lon if present; otherwise fall back to SECRET_LATLON (if configured)
+    latlons = df["start_latlng"].apply(lambda v: parse_latlon(v, fallback=SECRET_LATLON))
     df["lat"] = latlons.apply(lambda t: t[0] if t else np.nan)
     df["lon"] = latlons.apply(lambda t: t[1] if t else np.nan)
 
@@ -441,7 +441,7 @@ def main():
     print(f"{PRINT_PREFIX} WX_FLUSH_EVERY={WX_FLUSH_EVERY}")
     print(f"{PRINT_PREFIX} WX_ZERO_HOURS_IS_MISSING={int(WX_ZERO_HOURS_IS_MISSING)}")
     if WX_FORCE_REBUILD: print(f"{PRINT_PREFIX} WX_FORCE_REBUILD=1 (ignoring existing)")
-    if HOME_LATLON:
+    if SECRET_LATLON:
         print(f"{PRINT_PREFIX} Using SECRET fallback lat/lon when missing.")
     else:
         print(f"{PRINT_PREFIX} No SECRET fallback; missing coords will be skipped.")
