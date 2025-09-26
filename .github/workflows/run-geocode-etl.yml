@@ -16,13 +16,17 @@ on:
         required: false
         default: "25"
       places:
-        description: "Rounding places for cache key (3≈~120m, 2≈~1.1km)."
+        description: "Rounding places for cache key (3≈120m, 2≈1.1km)."
         required: false
         default: "3"
       provider:
         description: "Reverse geocoder: opencage | nominatim"
         required: false
         default: "opencage"
+      throttle_s:
+        description: "Seconds to sleep between lookups (use 1.0 for Nominatim)."
+        required: false
+        default: "0.25"
 
 permissions:
   contents: read
@@ -63,22 +67,24 @@ jobs:
 
       - name: Run Geocode ETL
         env:
+          # Required
           GCP_SVC_JSON: ${{ secrets.GCP_SVC_JSON }}
           SHEET_ID:     ${{ secrets.SHEET_ID }}
-          # Optional secrets / vars
-          OPENCAGE_API_KEY:   ${{ secrets.OPENCAGE_API_KEY }}
+          # Provider choice
+          OPENCAGE_API_KEY:     ${{ secrets.OPENCAGE_API_KEY }}
           NOMINATIM_USER_AGENT: ${{ vars.NOMINATIM_USER_AGENT }}
-          # Secret/home fallback (same as weather)
+          # Fallback coords
           SECRET_LAT:   ${{ secrets.SECRET_LAT }}
           SECRET_LON:   ${{ secrets.SECRET_LON }}
           HOME_LAT:     ${{ secrets.HOME_LAT }}
           HOME_LON:     ${{ secrets.HOME_LON }}
-          # Inputs
+          # Inputs → env
           RG_SINCE:       ${{ inputs.since }}
           RG_MAX_RIDES:   ${{ inputs.max_rides }}
           RG_FLUSH_EVERY: ${{ inputs.flush_every }}
           RG_PLACES:      ${{ inputs.places }}
           RG_PROVIDER:    ${{ inputs.provider }}
+          RG_THROTTLE_S:  ${{ inputs.throttle_s }}
         run: |
           echo "[RG] Starting Geocode ETL…"
           python geocode_etl.py
