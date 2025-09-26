@@ -1,4 +1,4 @@
-# weather_etl.py — incremental weather ETL: only process missing activities & keep existing rows
+# weather_etl.py — incremental weather ETL: only process missing activities & keep existing rows (no-clears-on-no-new)
 import os, json, math, time, re
 from datetime import datetime, timedelta, date
 from typing import Tuple, Optional
@@ -44,17 +44,8 @@ def read_tab_to_df(sh, title: str) -> pd.DataFrame:
         data = ws.get_all_records()
     return pd.DataFrame(data)
 
-def _ensure_tab_with_headers(sh, title: str, headers: list[str]):
-    try:
-        ws = sh.worksheet(title)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows="200", cols=str(max(26, len(headers)+5)))
-    ws.clear()
-    ws.update(values=[headers], range_name="A1")
-    ws.resize(rows=200, cols=max(26, len(headers)+5))
-    print(f"{PRINT_PREFIX} prepared tab '{title}' with headers.")
-
 def write_df_to_tab(sh, title: str, df: pd.DataFrame):
+    """Idempotent write: creates if missing, clears before writing (only when called)."""
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
@@ -90,7 +81,6 @@ def circular_mean_deg(deg_series: pd.Series) -> Optional[float]:
     return float(mean_deg)
 
 def parse_latlon(start_latlng_val) -> Optional[Tuple[float, float]]:
-    """start_latlng is a JSON string like '[41.63,-71.17]'. Return (lat, lon) or None."""
     if start_latlng_val in (None, "", "[]", "null"):
         return None
     try:
@@ -139,37 +129,25 @@ def om_request(lat: float, lon: float, start_iso: str, end_iso: str, retries: in
 
 # ---------------- Time helpers ----------------
 _TZ_RE = re.compile(r"([A-Za-z]+/[A-Za-z_]+)$")
-
 def extract_tz_name(tz_field: Optional[str]) -> Optional[str]:
-    """'(GMT-05:00) America/New_York' -> 'America/New_York'."""
     if not tz_field or not isinstance(tz_field, str):
         return None
-    m = _TZ_RE.search(tz_field.strip())
-    return m.group(1) if m else None
+    m = _TZ_RE.search(tz_field.strip()); return m.group(1) if m else None
 
 def to_local_naive_from_sheet_value(ts_val, tz_field: Optional[str]) -> Optional[datetime]:
-    """
-    Convert 'start_date_local' to true local tz-naive using sheet timezone:
-      - If value has 'Z' or offset -> treat as UTC, convert to tz_field, drop tz
-      - Else -> parse as naive local
-    """
     tzname = extract_tz_name(tz_field)
-    if ts_val is None or (isinstance(ts_val, float) and np.isnan(ts_val)):
-        return None
+    if ts_val is None or (isinstance(ts_val, float) and np.isnan(ts_val)): return None
     s = str(ts_val)
     if "Z" in s or "+" in s or s.endswith("Z"):
         ts = pd.to_datetime(s, errors="coerce", utc=True)
-        if pd.isna(ts):
-            return None
+        if pd.isna(ts): return None
         ts_local = ts.tz_convert(tzname) if tzname else ts
         return ts_local.tz_localize(None).to_pydatetime()
     ts = pd.to_datetime(s, errors="coerce")
-    if pd.isna(ts):
-        return None
+    if pd.isna(ts): return None
     return ts.to_pydatetime()
 
 def to_utc_naive(ts: datetime, tzname: Optional[str]) -> datetime:
-    """Return UTC-naive for stable comparisons."""
     ts_pd = pd.Timestamp(ts)
     if ts_pd.tz is not None:
         return ts_pd.tz_convert("UTC").tz_localize(None).to_pydatetime()
@@ -186,7 +164,7 @@ def to_utc_naive(ts: datetime, tzname: Optional[str]) -> datetime:
 
 # ---------------- Core ETL ----------------
 def build_weather(sh):
-    # Read activities
+    # Activities
     df_acts = read_tab_to_df(sh, TAB_ACTIVITIES)
     if df_acts.empty:
         print(f"{PRINT_PREFIX} activities_all is empty; nothing to do.")
@@ -197,7 +175,7 @@ def build_weather(sh):
     if missing:
         raise ValueError(f"Missing required columns in {TAB_ACTIVITIES}: {missing}")
 
-    # Read existing weather tabs (for incremental)
+    # Existing weather (for incremental)
     try:
         df_by_ride_existing = read_tab_to_df(sh, TAB_WX_BY_RIDE)
     except gspread.WorksheetNotFound:
@@ -226,13 +204,13 @@ def build_weather(sh):
     df["lat"] = latlons.apply(lambda t: t[0] if t else np.nan)
     df["lon"] = latlons.apply(lambda t: t[1] if t else np.nan)
 
-    # Optional scope
+    # Scope
     if WX_SINCE:
         since_dt = pd.to_datetime(WX_SINCE, errors="coerce")
         if pd.notna(since_dt):
             df = df[pd.to_datetime(df["start_dt_local"]) >= since_dt]
 
-    # Eligibility
+    # Eligible
     elig = df[
         df["activity_id"].notna()
         & pd.notna(df["start_dt_local"])
@@ -241,7 +219,7 @@ def build_weather(sh):
         & df["lon"].notna()
     ].copy()
 
-    # Incremental filter: drop already-processed ids unless forced
+    # Incremental skip
     if not WX_FORCE_REBUILD and existing_ids:
         before = len(elig)
         elig = elig[~elig["activity_id"].astype(int).isin(existing_ids)]
@@ -253,33 +231,11 @@ def build_weather(sh):
     total = len(elig)
     if total == 0:
         print(f"{PRINT_PREFIX} no new activities to process in scope.")
-        # Ensure tabs exist and keep existing content
-        hourly_headers = ["activity_id","ride_start_local","ride_end_local","lat","lon",
-                          "time_utc","temp_c","cloudcover_pct","windspeed_ms","windspeed_mph",
-                          "winddir_deg","weathercode","temp_f"]
-        agg_headers = ["activity_id","ride_start_local","ride_end_local","lat","lon",
-                       "avg_temp_f","avg_cloudcover_pct","avg_windspeed_mph","circmean_winddir_deg","hours_sampled"]
-        _ensure_tab_with_headers(sh, TAB_WX_HOURLY, hourly_headers)
-        _ensure_tab_with_headers(sh, TAB_WX_BY_RIDE, agg_headers)
-        # Write existing back (no-op if empty)
-        if not df_hourly_existing.empty:
-            write_df_to_tab(sh, TAB_WX_HOURLY, df_hourly_existing)
-        if not df_by_ride_existing.empty:
-            write_df_to_tab(sh, TAB_WX_BY_RIDE, df_by_ride_existing)
-        return pd.DataFrame(), pd.DataFrame()
-
-    # Prepare tabs up-front
-    hourly_headers = ["activity_id","ride_start_local","ride_end_local","lat","lon",
-                      "time_utc","temp_c","cloudcover_pct","windspeed_ms","windspeed_mph",
-                      "winddir_deg","weathercode","temp_f"]
-    agg_headers = ["activity_id","ride_start_local","ride_end_local","lat","lon",
-                   "avg_temp_f","avg_cloudcover_pct","avg_windspeed_mph","circmean_winddir_deg","hours_sampled"]
-    _ensure_tab_with_headers(sh, TAB_WX_HOURLY, hourly_headers)
-    _ensure_tab_with_headers(sh, TAB_WX_BY_RIDE, agg_headers)
+        # *** CRITICAL CHANGE: return existing data as-is; DO NOT clear tabs here ***
+        return df_hourly_existing, df_by_ride_existing
 
     # Accumulators (new rows only)
-    hourly_rows_new = []
-    agg_rows_new = []
+    hourly_rows_new, agg_rows_new = [], []
 
     for i, (_, row) in enumerate(elig.iterrows(), start=1):
         aid = int(row["activity_id"])
@@ -289,10 +245,8 @@ def build_weather(sh):
         lat, lon = float(row["lat"]), float(row["lon"])
 
         # OM date span (local)
-        start_day = start_dt_local.date()
-        end_day   = end_dt_local.date()
-        om_start = start_day.isoformat()
-        om_end   = end_day.isoformat()
+        start_day = start_dt_local.date(); end_day = end_dt_local.date()
+        om_start = start_day.isoformat();   om_end   = end_day.isoformat()
 
         try:
             data = om_request(lat, lon, om_start, om_end)
@@ -327,7 +281,6 @@ def build_weather(sh):
         df_h = df_h.loc[mask].copy()
 
         if df_h.empty:
-            # Grab the first hour at/after start if short ride doesn’t span a whole hour
             idxs = np.where(times_utc_naive.values >= start_floor_utc)[0]
             if len(idxs) > 0:
                 j = int(idxs[0])
@@ -373,18 +326,15 @@ def build_weather(sh):
             "hours_sampled": int(len(df_h))
         })
 
-        # Partial flush (combine existing + new-so-far, dedupe, then write)
+        # Partial flush: combine existing + new-so-far, dedupe, then write
         if i % WX_FLUSH_EVERY == 0:
             df_hourly_new_so_far = pd.concat(hourly_rows_new, ignore_index=True) if hourly_rows_new else pd.DataFrame(columns=["activity_id","time_utc"])
             df_by_ride_new_so_far = pd.DataFrame(agg_rows_new) if agg_rows_new else pd.DataFrame(columns=["activity_id"])
 
-            # Combine & dedupe
             hourly_combined = pd.concat([df_hourly_existing, df_hourly_new_so_far], ignore_index=True)
-            if not hourly_combined.empty:
+            if not hourly_combined.empty and "time_utc" in hourly_combined.columns:
                 hourly_combined["activity_id"] = pd.to_numeric(hourly_combined["activity_id"], errors="coerce").astype("Int64")
-                # Use activity_id + time_utc as unique key
-                if "time_utc" in hourly_combined.columns:
-                    hourly_combined = hourly_combined.drop_duplicates(subset=["activity_id","time_utc"], keep="last")
+                hourly_combined = hourly_combined.drop_duplicates(subset=["activity_id","time_utc"], keep="last")
 
             byride_combined = pd.concat([df_by_ride_existing, df_by_ride_new_so_far], ignore_index=True)
             if not byride_combined.empty:
@@ -398,15 +348,14 @@ def build_weather(sh):
         print(f"{PRINT_PREFIX} processed {i}/{total} (id={aid}).")
         time.sleep(THROTTLE_S)
 
-    # Final combine & write
+    # Final combine & return
     df_hourly_new = pd.concat(hourly_rows_new, ignore_index=True) if hourly_rows_new else pd.DataFrame(columns=["activity_id","time_utc"])
     df_by_ride_new = pd.DataFrame(agg_rows_new) if agg_rows_new else pd.DataFrame(columns=["activity_id"])
 
     hourly_final = pd.concat([df_hourly_existing, df_hourly_new], ignore_index=True)
-    if not hourly_final.empty:
+    if not hourly_final.empty and "time_utc" in hourly_final.columns:
         hourly_final["activity_id"] = pd.to_numeric(hourly_final["activity_id"], errors="coerce").astype("Int64")
-        if "time_utc" in hourly_final.columns:
-            hourly_final = hourly_final.drop_duplicates(subset=["activity_id","time_utc"], keep="last")
+        hourly_final = hourly_final.drop_duplicates(subset=["activity_id","time_utc"], keep="last")
 
     byride_final = pd.concat([df_by_ride_existing, df_by_ride_new], ignore_index=True)
     if not byride_final.empty:
@@ -427,7 +376,7 @@ def main():
 
     df_hourly_final, df_by_ride_final = build_weather(sh)
 
-    # Write final state
+    # Final write — writes what build_weather returns (existing+new or existing-only)
     write_df_to_tab(sh, TAB_WX_HOURLY, df_hourly_final)
     write_df_to_tab(sh, TAB_WX_BY_RIDE, df_by_ride_final)
 
