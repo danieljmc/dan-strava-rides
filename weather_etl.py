@@ -1,4 +1,4 @@
-# weather_etl.py — incremental weather ETL: only process missing activities & keep existing rows (no-clears-on-no-new)
+# weather_etl.py — incremental + missing-only: process new rides + any past missing rides; keep existing rows
 import os, json, math, time, re
 from datetime import datetime, timedelta, date
 from typing import Tuple, Optional
@@ -25,6 +25,9 @@ WX_SINCE         = os.getenv("WX_SINCE")                 # e.g., "2025-06-01"
 WX_MAX_RIDES     = int(os.getenv("WX_MAX_RIDES", "0"))   # 0 = no cap
 WX_FLUSH_EVERY   = int(os.getenv("WX_FLUSH_EVERY", "25"))
 WX_FORCE_REBUILD = os.getenv("WX_FORCE_REBUILD", "0") in ("1","true","True","YES","yes")
+
+# Treat summary rows without hours as "missing"?
+WX_ZERO_HOURS_IS_MISSING = os.getenv("WX_ZERO_HOURS_IS_MISSING", "1") in ("1","true","True","YES","yes")
 
 # Secret fallback location (env)
 def _env_float(name: str) -> Optional[float]:
@@ -102,19 +105,18 @@ def _is_valid_latlon(lat: float, lon: float) -> bool:
         lat = float(lat); lon = float(lon)
     except Exception:
         return False
-    if any([(lat != lat), (lon != lon)]):  # NaN check without math.isnan for robustness
+    if any([(lat != lat), (lon != lon)]):  # NaN check
         return False
     return (-90.0 <= lat <= 90.0) and (-180.0 <= lon <= 180.0)
 
 def parse_latlon(start_latlng_val, fallback: Optional[Tuple[float, float]] = None) -> Optional[Tuple[float, float]]:
     """
-    Robustly parse a [lat, lon] from list/tuple/str. Returns `fallback` when missing/invalid.
+    Parse [lat, lon] from list/tuple/str. Returns `fallback` when missing/invalid.
     Accepts:
       - [41.687101, -71.284574]
       - "[41.687101, -71.284574]"
       - "[]", "", None, "null", "NaN" -> fallback
     """
-    # list/tuple fast path
     if isinstance(start_latlng_val, (list, tuple)):
         if len(start_latlng_val) >= 2:
             try:
@@ -131,8 +133,6 @@ def parse_latlon(start_latlng_val, fallback: Optional[Tuple[float, float]] = Non
         s = start_latlng_val.strip()
         if s in ("", "[]", "null", "None", "NaN", "nan"):
             return fallback
-
-        # Quick manual parse
         core = s.strip("[]() ")
         parts = [p.strip() for p in core.split(",") if p.strip() != ""]
         if len(parts) >= 2:
@@ -142,8 +142,6 @@ def parse_latlon(start_latlng_val, fallback: Optional[Tuple[float, float]] = Non
                     return (lat, lon)
             except Exception:
                 pass
-
-        # JSON attempt
         try:
             arr = json.loads(s)
             return parse_latlon(arr, fallback=fallback)
@@ -233,7 +231,7 @@ def build_weather(sh):
     if missing:
         raise ValueError(f"Missing required columns in {TAB_ACTIVITIES}: {missing}")
 
-    # Existing weather (for incremental)
+    # Existing weather (for incremental decisions)
     try:
         df_by_ride_existing = read_tab_to_df(sh, TAB_WX_BY_RIDE)
     except gspread.WorksheetNotFound:
@@ -243,11 +241,17 @@ def build_weather(sh):
     except gspread.WorksheetNotFound:
         df_hourly_existing = pd.DataFrame(columns=["activity_id","time_utc"])
 
-    # Normalize existing keys
+    # Determine which existing rows truly count as "processed"
     if "activity_id" in df_by_ride_existing.columns:
-        existing_ids = set(pd.to_numeric(df_by_ride_existing["activity_id"], errors="coerce").dropna().astype(int).tolist())
+        ser_ids = pd.to_numeric(df_by_ride_existing["activity_id"], errors="coerce")
+        if "hours_sampled" in df_by_ride_existing.columns and WX_ZERO_HOURS_IS_MISSING:
+            ser_hours = pd.to_numeric(df_by_ride_existing["hours_sampled"], errors="coerce")
+            mask_valid = ser_hours.fillna(0) >= 1
+        else:
+            mask_valid = ser_ids.notna()
+        valid_existing_ids = set(ser_ids[mask_valid].dropna().astype(int).tolist())
     else:
-        existing_ids = set()
+        valid_existing_ids = set()
 
     # Parse activities
     df = df_acts.copy()
@@ -258,20 +262,19 @@ def build_weather(sh):
         to_local_naive_from_sheet_value(ts_val, tz_field)
         for ts_val, tz_field in zip(df["start_date_local"], df["timezone"])
     ]
-
     # Use real lat/lon if present; otherwise fall back to SECRET_LATLON (if configured)
     latlons = df["start_latlng"].apply(lambda v: parse_latlon(v, fallback=SECRET_LATLON))
     df["lat"] = latlons.apply(lambda t: t[0] if t else np.nan)
     df["lon"] = latlons.apply(lambda t: t[1] if t else np.nan)
 
-    # Scope
+    # Optional time scope
     if WX_SINCE:
         since_dt = pd.to_datetime(WX_SINCE, errors="coerce")
         if pd.notna(since_dt):
             df = df[pd.to_datetime(df["start_dt_local"]) >= since_dt]
 
-    # Eligible
-    elig = df[
+    # Base eligibility (must have times & coords)
+    elig_base = df[
         df["activity_id"].notna()
         & pd.notna(df["start_dt_local"])
         & df["elapsed_time_s"].notna()
@@ -279,19 +282,26 @@ def build_weather(sh):
         & df["lon"].notna()
     ].copy()
 
-    # Incremental skip
-    if not WX_FORCE_REBUILD and existing_ids:
-        before = len(elig)
-        elig = elig[~elig["activity_id"].astype(int).isin(existing_ids)]
-        print(f"{PRINT_PREFIX} skipping {before - len(elig)} already-processed activities (kept {len(elig)} new).")
+    # Missing-only targeting (activities not validly processed yet)
+    all_act_ids = set(pd.to_numeric(df["activity_id"], errors="coerce").dropna().astype(int).tolist())
+    if WX_FORCE_REBUILD:
+        target_ids = all_act_ids
+        mode_label = "FORCE (all activities)"
+    else:
+        missing_ids = all_act_ids - valid_existing_ids
+        target_ids = missing_ids
+        mode_label = f"missing-only ({len(missing_ids)} missing)"
 
+    elig = elig_base[elig_base["activity_id"].astype(int).isin(target_ids)].copy()
     if WX_MAX_RIDES > 0:
         elig = elig.sort_values("start_dt_local", ascending=False).head(WX_MAX_RIDES)
 
     total = len(elig)
+    print(f"{PRINT_PREFIX} selection mode: {mode_label}. Will process {total} ride(s).")
+
     if total == 0:
         print(f"{PRINT_PREFIX} no new activities to process in scope.")
-        # return existing data as-is; DO NOT clear tabs here
+        # Return existing data as-is; DO NOT clear tabs here
         return df_hourly_existing, df_by_ride_existing
 
     # Accumulators (new rows only)
@@ -425,10 +435,11 @@ def build_weather(sh):
     return hourly_final, byride_final
 
 def main():
-    print(f"{PRINT_PREFIX} START weather ETL (incremental)")
+    print(f"{PRINT_PREFIX} START weather ETL (incremental + missing-only)")
     if WX_SINCE: print(f"{PRINT_PREFIX} WX_SINCE={WX_SINCE}")
     if WX_MAX_RIDES: print(f"{PRINT_PREFIX} WX_MAX_RIDES={WX_MAX_RIDES}")
     print(f"{PRINT_PREFIX} WX_FLUSH_EVERY={WX_FLUSH_EVERY}")
+    print(f"{PRINT_PREFIX} WX_ZERO_HOURS_IS_MISSING={int(WX_ZERO_HOURS_IS_MISSING)}")
     if WX_FORCE_REBUILD: print(f"{PRINT_PREFIX} WX_FORCE_REBUILD=1 (ignoring existing)")
     if SECRET_LATLON:
         print(f"{PRINT_PREFIX} Using SECRET fallback lat/lon when missing.")
