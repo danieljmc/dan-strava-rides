@@ -24,7 +24,7 @@ RG_FORCE_REDO   = os.getenv("RG_FORCE_REDO", "0").lower() in ("1","true","yes")
 RG_PROVIDER     = os.getenv("RG_PROVIDER", "opencage").lower()  # opencage | nominatim
 
 OPENCAGE_KEY    = os.getenv("OPENCAGE_API_KEY", "").strip()
-NOMINATIM_UA    = os.getenv("NOMINATIM_USER_AGENT", "strava-tableau-etl/1.0 (contact: you@example.com)")
+NOMINATIM_UA    = os.getenv("NOMINATIM_USER_AGENT", "strava-tableau-etl/1.0 (contact: danieljmc@comcast.net)")
 
 THROTTLE_S      = float(os.getenv("RG_THROTTLE_S", "0.25"))
 REQ_TIMEOUT_S   = int(os.getenv("RG_REQ_TIMEOUT_S", "30"))
