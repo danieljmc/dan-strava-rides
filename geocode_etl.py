@@ -1,4 +1,4 @@
-# geocode_etl.py — reverse geocode (missing-only) with cache, single-write,
+# geocode_etl.py — reverse geocode (missing-only) with cache, single-write
 # optional time-based checkpoints, and 429 backoff on Sheets writes.
 
 import os, json, time, re
