@@ -26,20 +26,24 @@ RG_PROVIDER     = os.getenv("RG_PROVIDER", "opencage").lower()  # opencage | nom
 OPENCAGE_KEY    = os.getenv("OPENCAGE_API_KEY", "").strip()
 NOMINATIM_UA    = os.getenv("NOMINATIM_USER_AGENT", "strava-tableau-etl/1.0 (contact: danieljmc@comcast.net)")
 
-THROTTLE_S      = float(os.getenv("RG_THROTTLE_S", "0.25"))
+THROTTLE_S      = float(os.getenv("RG_THROTTLE_S", "0.25"))  # Set to 1.0 for Nominatim
 REQ_TIMEOUT_S   = int(os.getenv("RG_REQ_TIMEOUT_S", "30"))
 
 # Secret fallback lat/lon (same pattern as weather_etl)
-def _env_float(name): 
-    v = os.getenv(name); 
-    if v is None or str(v).strip()=="" : return None
-    try: return float(v)
-    except: return None
+def _env_float(name):
+    v = os.getenv(name)
+    if v is None or str(v).strip()=="":
+        return None
+    try:
+        return float(v)
+    except:
+        return None
 
 def _env_float_any(names):
     for n in names:
         val = _env_float(n)
-        if val is not None: return val, n
+        if val is not None:
+            return val, n
     return None, None
 
 SECRET_LAT, lat_key = _env_float_any(["SECRET_LAT","HOME_LAT"])
@@ -77,11 +81,14 @@ def write_df_to_tab(sh, title, df: pd.DataFrame):
     set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
     print(f"{PRINT_PREFIX} wrote {len(df)} rows × {len(df.columns)} cols to '{title}'.")
 
-# ------------- Lat/Lon parsing (same robustness as weather) -------------
+# ------------- Lat/Lon parsing -------------
 def _is_valid_latlon(lat, lon):
-    try: lat=float(lat); lon=float(lon)
-    except: return False
-    if any([(lat!=lat), (lon!=lon)]): return False  # NaN
+    try:
+        lat=float(lat); lon=float(lon)
+    except:
+        return False
+    if any([(lat!=lat), (lon!=lon)]):  # NaN
+        return False
     return -90.0<=lat<=90.0 and -180.0<=lon<=180.0
 
 def parse_latlon(val, fallback: Optional[Tuple[float,float]] = None) -> Optional[Tuple[float,float]]:
@@ -89,7 +96,8 @@ def parse_latlon(val, fallback: Optional[Tuple[float,float]] = None) -> Optional
         try:
             lt, ln = float(val[0]), float(val[1])
             return (lt, ln) if _is_valid_latlon(lt, ln) else fallback
-        except: return fallback
+        except:
+            return fallback
     if val is None: return fallback
     if isinstance(val, str):
         s = val.strip()
@@ -100,12 +108,14 @@ def parse_latlon(val, fallback: Optional[Tuple[float,float]] = None) -> Optional
             try:
                 lt, ln = float(parts[0]), float(parts[1])
                 if _is_valid_latlon(lt, ln): return (lt, ln)
-            except: pass
+            except:
+                pass
         try:
-            arr = json.loads(s); 
+            arr = json.loads(s)
             if isinstance(arr,(list,tuple)) and len(arr)>=2:
                 return parse_latlon(arr, fallback=fallback)
-        except: return fallback
+        except:
+            return fallback
     return fallback
 
 # ------------- Providers -------------
@@ -117,7 +127,8 @@ def revgeo_opencage(lat, lon):
     r = requests.get(url, params=params, timeout=REQ_TIMEOUT_S)
     r.raise_for_status()
     data = r.json()
-    if not data.get("results"): return None
+    if not data.get("results"):
+        return None
     res = data["results"][0]
     c = res.get("components", {})
     city = c.get("city") or c.get("town") or c.get("village") or c.get("hamlet")
@@ -148,8 +159,10 @@ def reverse_geocode(lat, lon):
 # ------------- Core -------------
 def main():
     print(f"{PRINT_PREFIX} START reverse-geocode ETL (missing-only)")
-    if SECRET_LATLON: print(f"{PRINT_PREFIX} Using SECRET fallback lat/lon from {lat_key}/{lon_key}.")
-    else: print(f"{PRINT_PREFIX} No SECRET fallback; activities without coords will be skipped.")
+    if SECRET_LATLON:
+        print(f"{PRINT_PREFIX} Using SECRET fallback lat/lon from {lat_key}/{lon_key}.")
+    else:
+        print(f"{PRINT_PREFIX} No SECRET fallback; activities without coords will be skipped.")
     print(f"{PRINT_PREFIX} Provider={RG_PROVIDER}, places={RG_PLACES}, flush_every={RG_FLUSH_EVERY}")
 
     gc = gspread_client_from_secret()
@@ -185,7 +198,7 @@ def main():
     df_geo   = read_tab_to_df(sh, TAB_GEO_BY_RIDE)
 
     # Build rounded keys
-    def rnd(x): 
+    def rnd(x):
         try: return round(float(x), RG_PLACES)
         except: return np.nan
     base["lat_round"] = base["lat"].apply(rnd)
@@ -242,16 +255,13 @@ def main():
     else:
         df_cache_all = df_cache.copy()
 
-    # --- Build geo_by_ride rows (join to cache by rounded keys) ---
-    if df_cache_all.empty:
-        # nothing to map yet
-        geo_new = pd.DataFrame(columns=["activity_id","lat","lon","city","state","country","display_name","lat_round","lon_round"])
-    else:
-        target = target.copy()
-        target = target.merge(df_cache_all, on=["lat_round","lon_round"], how="left")
-        geo_new = target[["activity_id","lat","lon","city","state","country","display_name","lat_round","lon_round"]].copy()
+    # Ensure expected cache columns exist (even if empty/new)
+    EXPECTED_CACHE_COLS = ["lat_round","lon_round","city","state","country","display_name","source","updated_at"]
+    for c in EXPECTED_CACHE_COLS:
+        if c not in df_cache_all.columns:
+            df_cache_all[c] = pd.Series(dtype="object")
 
-    # --- Combine + partial flush pattern ---
+    # --- helper: single flush ---
     def flush(df_cache_all_local, geo_new_local, i=None, total=None):
         if i is not None:
             print(f"{PRINT_PREFIX} flushing {i}/{total} …")
@@ -266,16 +276,19 @@ def main():
             geo_comb = geo_new_local
         write_df_to_tab(sh, TAB_GEO_BY_RIDE, geo_comb)
 
-    # If target is big, chunk & flush; otherwise one shot
+    # --- Build geo_by_ride rows (chunked or single-shot) ---
+    GEO_COLS = ["activity_id","lat","lon","city","state","country","display_name","lat_round","lon_round"]
+
     if len(target) > 0 and RG_FLUSH_EVERY > 0 and len(target) > RG_FLUSH_EVERY:
-        # simple chunking by rows
         total = len(target)
         chunks = [target.iloc[i:i+RG_FLUSH_EVERY] for i in range(0, total, RG_FLUSH_EVERY)]
         for idx, chunk in enumerate(chunks, start=1):
-            chunk = chunk.merge(df_cache_all, on=["lat_round","lon_round"], how="left")
-            geo_chunk = chunk[["activity_id","lat","lon","city","state","country","display_name","lat_round","lon_round"]]
-            flush(df_cache_all, geo_chunk, i=idx*RG_FLUSH_EVERY if idx< len(chunks) else total, total=total)
+            merged = chunk.merge(df_cache_all, on=["lat_round","lon_round"], how="left")
+            geo_chunk = merged.reindex(columns=GEO_COLS)
+            flush(df_cache_all, geo_chunk, i=min(idx*RG_FLUSH_EVERY, total), total=total)
     else:
+        merged = target.merge(df_cache_all, on=["lat_round","lon_round"], how="left")
+        geo_new = merged.reindex(columns=GEO_COLS)
         flush(df_cache_all, geo_new)
 
     print(f"{PRINT_PREFIX} DONE. Provider={RG_PROVIDER}. Tabs updated: {TAB_REV_CACHE}, {TAB_GEO_BY_RIDE}")
