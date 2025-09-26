@@ -1,6 +1,7 @@
 # weather_smoke_test.py
 import os, requests, datetime as dt
 
+
 def om_hourly(lat, lon, date_iso):
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
