@@ -1,6 +1,7 @@
 # strava_smoke_test.py
 import os, sys, requests, pprint
 
+
 REQUIRED = ["STRAVA_CLIENT_ID", "STRAVA_CLIENT_SECRET", "STRAVA_REFRESH_TOKEN"]
 missing = [k for k in REQUIRED if not os.getenv(k)]
 if missing:
