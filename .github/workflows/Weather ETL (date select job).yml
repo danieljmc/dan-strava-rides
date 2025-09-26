@@ -70,6 +70,11 @@ jobs:
           # Required secrets (set these in your repo settings → Secrets and variables → Actions)
           GCP_SVC_JSON: ${{ secrets.GCP_SVC_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          # Provide both names for compatibility, care for missing long/lat
+          SECRET_LAT:   ${{ secrets.SECRET_LAT }}
+          SECRET_LON:   ${{ secrets.SECRET_LON }}
+          HOME_LAT:     ${{ secrets.HOME_LAT }}
+          HOME_LON:     ${{ secrets.HOME_LON }}
           # Optional tuning (from workflow_dispatch inputs)
           WX_SINCE: ${{ inputs.since }}
           WX_MAX_RIDES: ${{ inputs.max_rides }}
