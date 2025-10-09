@@ -39,6 +39,8 @@ It’s designed to be:
                           | (distance, duration, weather) |
                           +------------------------------+
 
+---
+
 ## 📊 Tableau Dashboard
 
 View it on Tableau Public →  
@@ -47,3 +49,4 @@ View it on Tableau Public →
 *Example preview:*  
 ![Dashboard preview](docs/tableau_preview.png)
 
+---
