@@ -1,4 +1,4 @@
-# 🚴‍♂️ Strava → Google Sheets ETL Pipeline  
+# 🚴‍♂️ Strava → Google Sheets ETL Pipeline
 **Incremental ride ingestion with weather, reverse-geocoding, and Tableau dashboards**
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)]()
@@ -11,9 +11,9 @@
 This project automates extraction of personal **Strava** activity data, enriches it with **weather** and **reverse-geocoded** location details, and writes the results to a connected **Google Sheet** for analysis in **Tableau Public**.
 
 It’s designed to be:
-- **Incremental** – only new or missing rides are pulled.
-- **Cache-aware** – weather and geo lookups are stored to avoid API overuse.
-- **Portfolio-ready** – demonstrates practical ETL, API handling, and BI visualization.
+- **Incremental** – only new or missing rides are pulled  
+- **Cache-aware** – weather and geo lookups are stored to avoid API overuse  
+- **Portfolio-ready** – demonstrates practical ETL, API handling, and BI visualization  
 
 ---
 
@@ -38,18 +38,3 @@ It’s designed to be:
                           | Tableau Public Dashboard     |
                           | (distance, duration, weather) |
                           +------------------------------+
-```
----
-
-## 📊 Tableau Dashboard
-
-View it on Tableau Public →  
-🔗 [**Strava Rides Dashboard**](https://public.tableau.com/app/profile/daniel.mccomb4807)
-
-*Example preview:*  
-![Dashboard preview](docs/tableau_preview.png)
-
----
-
-
-
