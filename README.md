@@ -38,7 +38,7 @@ It’s designed to be:
                           | Tableau Public Dashboard     |
                           | (distance, duration, weather) |
                           +------------------------------+
-
+```
 ---
 
 ## 📊 Tableau Dashboard
