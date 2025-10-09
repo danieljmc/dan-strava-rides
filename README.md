@@ -39,5 +39,11 @@ It’s designed to be:
                           | (distance, duration, weather) |
                           +------------------------------+
 
+## 📊 Tableau Dashboard
+
+View it on Tableau Public →  
+🔗 [**Strava Rides Dashboard**](https://public.tableau.com/app/profile/daniel.mccomb4807)
+
+*Example preview:*  
 ![Dashboard preview](docs/tableau_preview.png)
 
