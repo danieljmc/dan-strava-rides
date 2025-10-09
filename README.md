@@ -1,28 +1,40 @@
-# Pull Strava, weather, and geo data to visualize data from activites on Tableau Dashboard.
+# 🚴‍♂️ Strava → Google Sheets ETL Pipeline  
+**Incremental ride ingestion with weather, reverse-geocoding, and Tableau dashboards**
 
-Link to Tableau Dashboard: https://public.tableau.com/app/profile/daniel.mccomb4807/viz/StravaETL/Dashboard1?publish=yes
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Last Commit](https://img.shields.io/github/last-commit/danieljmc/dan-strava-rides.svg)]()
 
-Workflow:
-1) Extract: Connect to Strava API to read my rides
-2) Transform:
-  a) Write all fields to sheet
-  b) Extract additional riders for anyone after "with" in the name (Due to inconsistent naming, some riders are missed when "with" isn't in the title, some false positives exsit and need to manually be added to stopwords)
-  a) Write all fields to sheet "activities_all" tab.
-  b) Extract additional riders for anyone after "with" in the name (Due to inconsistent naming, some riders are missed when "with" isn't in the title, some false positives exsit and need to manually be added to stopwords). Writes to "riders_long" tab.
-  c) Add line for " Solo" when there are no riders for Tableau filter.  Opted for ETL transformation vs calculated field in Tableau.
-4) Load: Connect to Google sheets and write the transformed data
-5) Visualize in Tableau Public: Linked dataset in Tableau to google sheets.
-5) Connect API to weather and update two tabs
-   a) Pulls hourly data for the start/end time of the activity based on latitude and longtitude from Strava. Uses Fall River, MA when no geo data present. Writes to "weather_hourly"
-   b) Creates "weather_by_ride" which is an average of weather data by ride.  Joins in tableau by activity ID.
-6) Connect API to Geodata and update two tabs.
-    a) Pulls geo data by ride (revgeo_cache) and converts to city "geo_by_ride".
-7) Visualize in Tableau Public: Linked dataset in Tableau to google sheets.
+---
 
-Files:
-pipeline.py - main python code for the ETL process
-pipelyne.py -  python code for the ETL process from Strava
-geocode_etl.py -  python code for ETL to get city data
-weather_etl.py -  python code for ETL to get weather data
-sheets_smoke_test.py - simple test to confirm API access to create the Google Sheets
-strava_smoke_test.py - simple test to confirm API access to read from Strava
+### 🌟 Overview
+This project automates extraction of personal **Strava** activity data, enriches it with **weather** and **reverse-geocoded** location details, and writes the results to a connected **Google Sheet** for analysis in **Tableau Public**.
+
+It’s designed to be:
+- **Incremental** – only new or missing rides are pulled.
+- **Cache-aware** – weather and geo lookups are stored to avoid API overuse.
+- **Portfolio-ready** – demonstrates practical ETL, API handling, and BI visualization.
+
+---
+
+## 🏗️ Architecture
+
+```text
+          +-------------+        +------------------+
+          |  Strava API | -----> |  pipeline.py     |
+          +-------------+        |  (activities &   |
+                                 |  rider parsing)  |
+                                        |
+                                        v
+                         +--------------------------------+
+                         |  Google Sheet (Strava Rides)   |
+                         |--------------------------------|
+                         | activities_all  | riders_long  |
+                         | weather_hourly  | weather_by_ride |
+                         | revgeo_cache    | geo_by_ride   |
+                         +--------------------------------+
+                                        |
+                          +------------------------------+
+                          | Tableau Public Dashboard     |
+                          | (distance, duration, weather) |
+                          +------------------------------+
