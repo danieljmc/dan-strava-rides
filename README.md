@@ -38,3 +38,6 @@ It’s designed to be:
                           | Tableau Public Dashboard     |
                           | (distance, duration, weather) |
                           +------------------------------+
+
+![Dashboard preview](docs/tableau_preview.png)
+
