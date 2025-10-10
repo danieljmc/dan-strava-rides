@@ -1,8 +1,8 @@
 name: Strava → Google Sheets (rides)
 on:
   workflow_dispatch: {}         # run on demand
-  schedule:
-    - cron: "0 9 * * *"         # daily 09:00 UTC (adjust if you like)
+#  schedule:
+#    - cron: "0 9 * * *"         # daily 09:00 UTC (adjust if you like)
 
 jobs:
   run:
